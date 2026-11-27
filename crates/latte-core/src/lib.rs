@@ -7,8 +7,9 @@ mod session;
 mod state;
 
 pub use ids::{
-    Clock, CommandId, EventId, IdSource, SessionCommandId, SessionEventId, SessionId, SystemClock,
-    SystemIdSource, TranscriptEntryId, TurnId, wall_time_ms,
+    Clock, EffectId, EventId, IdSource, ProjectKey, RoundId, SessionCommandId, SessionEffectKind,
+    SessionEventId, SessionId, SystemClock, SystemIdSource, TranscriptEntryId, TurnId,
+    wall_time_ms,
 };
 pub use profile::*;
 pub use protocol::*;

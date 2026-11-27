@@ -153,7 +153,8 @@ impl ServerState {
 pub enum ServerEvent {
     SessionChanged {
         session_id: String,
-        revision: u64,
+        #[serde(rename = "revision", alias = "session_revision")]
+        session_revision: u64,
     },
     Progress {
         session_id: String,
@@ -197,6 +198,10 @@ pub fn router(state: Arc<ServerState>) -> Router {
         )
         .route("/v1/sessions/{session_id}/follow-up", post(follow_up))
         .route("/v1/sessions/{session_id}/model", post(switch_model))
+        .route(
+            "/v1/sessions/{session_id}/permission-mode",
+            post(set_permission_mode),
+        )
         .route("/v1/sessions/{session_id}/cancel", post(cancel_session))
         .route("/v1/sessions/{session_id}/queue", post(queue_follow_up))
         .route(
@@ -279,6 +284,8 @@ pub struct CreateSessionRequest {
     pub binding: SessionProviderBinding,
     #[serde(default)]
     pub focus: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<latte_core::PermissionMode>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -337,6 +344,19 @@ pub struct FollowUpRequest {
     pub command_id: latte_core::SessionCommandId,
     pub prompt: String,
     pub expected_session_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<latte_core::PermissionMode>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SetPermissionModeRequest {
+    pub permission_mode: latte_core::PermissionMode,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PermissionModeResponse {
+    pub session_id: String,
+    pub permission_mode: latte_core::PermissionMode,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -520,13 +540,19 @@ async fn create_session(
         ));
     }
     let idempotency = scoped_idempotency_key(&state, &headers, &format!("create:{workspace_id}"));
-    let payload_digest = canonical_digest(&serde_json::json!({
+    let mut digest_body = serde_json::json!({
         "session_id": req.session_id.to_string(),
         "command_id": req.command_id.to_string(),
         "prompt": &req.prompt,
         "binding": serde_json::to_value(&req.binding).unwrap_or(serde_json::Value::Null),
         "focus": req.focus,
-    }));
+    });
+    if let Some(mode) = req.permission_mode
+        && let Some(obj) = digest_body.as_object_mut()
+    {
+        obj.insert("permission_mode".into(), serde_json::json!(mode));
+    }
+    let payload_digest = canonical_digest(&digest_body);
     // Atomically claim the key: replay a prior result, reject a concurrent
     // in-flight retry, or become the owner responsible for producing it.
     if let Some(key) = &idempotency {
@@ -588,18 +614,20 @@ async fn create_session_owned(
     let prompt = req.prompt;
     let focus = req.focus.map(std::path::PathBuf::from);
     let binding = req.binding;
+    let permission_mode = req.permission_mode;
 
     // Run the turn under supervised background execution, but only acknowledge
     // 202 after the runtime signals the submission is durably accepted.
     let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         if let Err(error) = runtime
-            .start_accepted(
+            .start_accepted_with_mode(
                 session_id,
                 command_id,
                 prompt,
                 binding,
                 focus.as_deref(),
+                permission_mode,
                 accept_tx,
             )
             .await
@@ -627,12 +655,12 @@ async fn create_session_owned(
     // Wake subscribers so they fetch the new session snapshot.
     let _ = workspace.event_tx.send(ServerEvent::SessionChanged {
         session_id: session_id.to_string(),
-        revision: outcome.revision,
+        session_revision: outcome.session_revision,
     });
 
     let body = SessionCreatedResponse {
         session_id: session_id.to_string(),
-        accepted_revision: outcome.revision,
+        accepted_revision: outcome.session_revision,
     };
     Ok((status, body))
 }
@@ -791,7 +819,7 @@ async fn compact_session(
                 let current = workspace
                     .snapshot(session_id)
                     .ok()
-                    .map(|snapshot| snapshot.revision);
+                    .map(|snapshot| snapshot.session_revision);
                 conflict("session is not idle for manual compaction", current)
             } else {
                 failed(&format!("manual compaction failed: {error}"))
@@ -828,7 +856,7 @@ async fn arm_session_reminder(
                 let current = workspace
                     .snapshot(session_id)
                     .ok()
-                    .map(|snapshot| snapshot.revision);
+                    .map(|snapshot| snapshot.session_revision);
                 conflict("session is not idle for arming a reminder", current)
             }
             // Empty/oversize/redacted-to-empty text is a client error.
@@ -864,11 +892,17 @@ async fn follow_up(
         ));
     }
     let idempotency = scoped_idempotency_key(&state, &headers, &format!("follow-up:{id}"));
-    let payload_digest = canonical_digest(&serde_json::json!({
+    let mut digest_body = serde_json::json!({
         "command_id": req.command_id.to_string(),
         "prompt": &req.prompt,
         "expected_session_revision": req.expected_session_revision,
-    }));
+    });
+    if let Some(mode) = req.permission_mode
+        && let Some(obj) = digest_body.as_object_mut()
+    {
+        obj.insert("permission_mode".into(), serde_json::json!(mode));
+    }
+    let payload_digest = canonical_digest(&digest_body);
     if let Some(key) = &idempotency {
         match state.idempotency_claim(key, &payload_digest) {
             IdempotencyClaim::Replay(record) => {
@@ -912,11 +946,19 @@ async fn follow_up_owned(
     let command_id = req.command_id;
     let prompt = req.prompt;
     let expected = req.expected_session_revision;
+    let permission_mode = req.permission_mode;
 
     let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         if let Err(error) = runtime
-            .follow_up_accepted(session_id, command_id, expected, prompt, accept_tx)
+            .follow_up_accepted_with_mode(
+                session_id,
+                command_id,
+                expected,
+                prompt,
+                permission_mode,
+                accept_tx,
+            )
             .await
         {
             warn!("session {session_id} background follow-up failed: {error}");
@@ -935,14 +977,40 @@ async fn follow_up_owned(
 
     let _ = workspace.event_tx.send(ServerEvent::SessionChanged {
         session_id: session_id.to_string(),
-        revision: outcome.revision,
+        session_revision: outcome.session_revision,
     });
 
     let body = FollowUpResponse {
-        accepted_revision: outcome.revision,
+        accepted_revision: outcome.session_revision,
         workspace_id: workspace.id.clone(),
     };
     Ok((status, body))
+}
+
+async fn set_permission_mode(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+    ValidatedJson(req): ValidatedJson<SetPermissionModeRequest>,
+) -> Result<Json<PermissionModeResponse>, HandlerError> {
+    let session_id = parse_session_id(&id)?;
+    let workspace = lookup_workspace(&state, session_id).await?;
+    let snapshot = workspace
+        .runtime
+        .set_permission_mode_checked(session_id, req.permission_mode)
+        .map_err(|error| match error {
+            SessionRuntimeError::Storage(latte_engine::StorageError::SessionNotFound(_)) => {
+                not_found("session not found")
+            }
+            other => failed(&format!("failed to update permission mode: {other}")),
+        })?;
+    let _ = workspace.event_tx.send(ServerEvent::SessionChanged {
+        session_id: session_id.to_string(),
+        session_revision: snapshot.session_revision,
+    });
+    Ok(Json(PermissionModeResponse {
+        session_id: session_id.to_string(),
+        permission_mode: snapshot.permission_mode,
+    }))
 }
 
 async fn switch_model(
@@ -960,7 +1028,10 @@ async fn switch_model(
     {
         Ok(snapshot) => Ok(Json(SessionResponse { snapshot })),
         Err(error) => {
-            let current = workspace.snapshot(session_id).ok().map(|s| s.revision);
+            let current = workspace
+                .snapshot(session_id)
+                .ok()
+                .map(|s| s.session_revision);
             Err(map_runtime_error(&error, current.unwrap_or_default()))
         }
     }
@@ -987,7 +1058,10 @@ async fn cancel_session(
         Err(error) => {
             // On a fence/state rejection, surface the current revision so the
             // client can re-fetch and retry.
-            let current = workspace.snapshot(session_id).ok().map(|s| s.revision);
+            let current = workspace
+                .snapshot(session_id)
+                .ok()
+                .map(|s| s.session_revision);
             Err(map_runtime_error(&error, current.unwrap_or_default()))
         }
     }
@@ -1046,7 +1120,10 @@ async fn resolve_permission(
     {
         Ok(snapshot) => Ok(Json(SessionResponse { snapshot })),
         Err(error) => {
-            let current = workspace.snapshot(session_id).ok().map(|s| s.revision);
+            let current = workspace
+                .snapshot(session_id)
+                .ok()
+                .map(|s| s.session_revision);
             Err(map_runtime_error(&error, current.unwrap_or_default()))
         }
     }
@@ -1077,7 +1154,10 @@ async fn provide_input(
     {
         Ok(snapshot) => Ok(Json(SessionResponse { snapshot })),
         Err(error) => {
-            let current = workspace.snapshot(session_id).ok().map(|s| s.revision);
+            let current = workspace
+                .snapshot(session_id)
+                .ok()
+                .map(|s| s.session_revision);
             Err(map_runtime_error(&error, current.unwrap_or_default()))
         }
     }
@@ -1088,6 +1168,7 @@ async fn reconcile_effect(
     Path((id, effect_id)): Path<(String, String)>,
 ) -> Result<Json<SessionResponse>, HandlerError> {
     let session_id = parse_session_id(&id)?;
+    latte_core::EffectId::new(&effect_id).map_err(|error| bad_request(&error))?;
     let workspace = lookup_workspace(&state, session_id).await?;
 
     match workspace
@@ -1120,7 +1201,7 @@ async fn rename_session(
         .map_err(|error| failed(&format!("snapshot failed: {error}")))?;
     let _ = workspace.event_tx.send(ServerEvent::SessionChanged {
         session_id: session_id.to_string(),
-        revision: snapshot.revision,
+        session_revision: snapshot.session_revision,
     });
     Ok(Json(SessionResponse { snapshot }))
 }
@@ -1148,7 +1229,7 @@ async fn fork_session(
         .map_err(|error| failed(&format!("fork failed: {error}")))?;
     let _ = workspace.event_tx.send(ServerEvent::SessionChanged {
         session_id: fork_id.to_string(),
-        revision: snapshot.revision,
+        session_revision: snapshot.session_revision,
     });
     Ok(Json(SessionResponse { snapshot }))
 }
@@ -1349,8 +1430,8 @@ async fn workspace_events(
     // Get the workspace's event receiver
     let workspace = state.workspaces.get_by_id(&workspace_id).await;
 
-    let rx = match workspace {
-        Some(ws) => ws.event_tx.subscribe(),
+    let (rx, progress_rx) = match workspace {
+        Some(ws) => (ws.event_tx.subscribe(), ws.progress_tx.subscribe()),
         None => {
             // Return an empty stream if workspace not found
             let empty: std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
@@ -1359,22 +1440,27 @@ async fn workspace_events(
         }
     };
 
-    let stream = BroadcastStream::new(rx).map(|result| {
-        match result {
-            Ok(event) => {
-                let event_type = match &event {
-                    ServerEvent::SessionChanged { .. } => "session_changed",
-                    ServerEvent::Progress { .. } => "progress",
-                    ServerEvent::ResyncRequired => "resync_required",
-                };
-                let data = serde_json::to_string(&event).unwrap_or_default();
-                Ok(Event::default().event(event_type).data(data))
-            }
-            // A lagged broadcast receiver means the client fell behind the
-            // channel capacity. Signal a resync instead of terminating.
-            Err(_) => Ok(Event::default().event("resync_required").data("{}")),
+    let authoritative = BroadcastStream::new(rx).map(|result| match result {
+        Ok(event) => {
+            let event_type = match &event {
+                ServerEvent::SessionChanged { .. } => "session_changed",
+                ServerEvent::Progress { .. } => "progress",
+                ServerEvent::ResyncRequired => "resync_required",
+            };
+            let data = serde_json::to_string(&event).unwrap_or_default();
+            Ok(Event::default().event(event_type).data(data))
         }
+        // A lagged authoritative receiver means the client fell behind the
+        // durable state-change channel capacity. Signal a resync.
+        Err(_) => Ok(Event::default().event("resync_required").data("{}")),
     });
+    let transient = BroadcastStream::new(progress_rx).filter_map(|result| {
+        result.ok().map(|event| {
+            let data = serde_json::to_string(&event).unwrap_or_default();
+            Ok(Event::default().event("progress").data(data))
+        })
+    });
+    let stream = authoritative.merge(transient);
 
     let stream: std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
         Box::pin(stream);
@@ -1385,12 +1471,14 @@ async fn workspace_events(
 /// `LATTE_RECOVERY_SWEEP_MS` environment variable overrides it (in
 /// milliseconds, clamped to at least 1ms) so end-to-end tests can drive the
 /// crash-recovery journey without waiting the full production cadence.
-fn recovery_sweep_interval() -> std::time::Duration {
-    std::env::var("LATTE_RECOVERY_SWEEP_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
+fn parse_recovery_sweep_interval(raw: Option<&str>) -> std::time::Duration {
+    raw.and_then(|value| value.parse::<u64>().ok())
         .map(|ms| std::time::Duration::from_millis(ms.max(1)))
         .unwrap_or_else(|| std::time::Duration::from_secs(30))
+}
+
+fn recovery_sweep_interval() -> std::time::Duration {
+    parse_recovery_sweep_interval(std::env::var("LATTE_RECOVERY_SWEEP_MS").ok().as_deref())
 }
 
 /// Serve until `shutdown` resolves. Separating the shutdown future lets tests
@@ -1551,7 +1639,7 @@ mod tests {
     /// idle state and the follow-up/switch/read success paths are reachable.
     fn completing_state() -> Arc<ServerState> {
         use latte_headless::provider::{FakeProvider, ProviderResponse, ProviderUsage};
-        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+        use latte_headless::registry::{ProviderModelBinding, ResolvedProvider};
 
         let factory: latte_headless::session::SessionProviderFactory =
             std::sync::Arc::new(|binding: &latte_core::SessionProviderBinding| {
@@ -1565,8 +1653,8 @@ mod tests {
                 }]);
                 Ok(ResolvedProvider {
                     provider: std::sync::Arc::new(provider),
-                    binding: ProviderBinding {
-                        version: binding.version,
+                    binding: ProviderModelBinding {
+                        binding_version: binding.binding_version,
                         provider_name: binding.provider_name.clone(),
                         provider_type: binding.provider_type.clone(),
                         protocol: binding.protocol.clone(),
@@ -1607,7 +1695,7 @@ mod tests {
     /// path is reachable.
     fn permission_state() -> Arc<ServerState> {
         use latte_headless::provider::{FakeProvider, ProviderResponse, ProviderUsage, ToolCall};
-        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+        use latte_headless::registry::{ProviderModelBinding, ResolvedProvider};
 
         let factory: latte_headless::session::SessionProviderFactory =
             std::sync::Arc::new(|binding: &latte_core::SessionProviderBinding| {
@@ -1639,8 +1727,8 @@ mod tests {
                 ]);
                 Ok(ResolvedProvider {
                     provider: std::sync::Arc::new(provider),
-                    binding: ProviderBinding {
-                        version: binding.version,
+                    binding: ProviderModelBinding {
+                        binding_version: binding.binding_version,
                         provider_name: binding.provider_name.clone(),
                         provider_type: binding.provider_type.clone(),
                         protocol: binding.protocol.clone(),
@@ -1695,7 +1783,7 @@ mod tests {
         use latte_headless::provider::{
             FakeProvider, InputRequest, ProviderResponse, ProviderUsage,
         };
-        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+        use latte_headless::registry::{ProviderModelBinding, ResolvedProvider};
 
         let factory: latte_headless::session::SessionProviderFactory =
             std::sync::Arc::new(|binding: &latte_core::SessionProviderBinding| {
@@ -1723,8 +1811,8 @@ mod tests {
                 ]);
                 Ok(ResolvedProvider {
                     provider: std::sync::Arc::new(provider),
-                    binding: ProviderBinding {
-                        version: binding.version,
+                    binding: ProviderModelBinding {
+                        binding_version: binding.binding_version,
                         provider_name: binding.provider_name.clone(),
                         provider_type: binding.provider_type.clone(),
                         protocol: binding.protocol.clone(),
@@ -2879,7 +2967,7 @@ mod tests {
         // every server event type to its named frame.
         let _ = workspace.event_tx.send(ServerEvent::SessionChanged {
             session_id: "abc".into(),
-            revision: 7,
+            session_revision: 7,
         });
         let _ = workspace.event_tx.send(ServerEvent::Progress {
             session_id: "abc".into(),
@@ -3732,14 +3820,14 @@ mod tests {
     }
 
     fn blocking_state(gate: std::sync::Arc<tokio::sync::Notify>) -> Arc<ServerState> {
-        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+        use latte_headless::registry::{ProviderModelBinding, ResolvedProvider};
 
         let factory: latte_headless::session::SessionProviderFactory =
             std::sync::Arc::new(move |binding: &latte_core::SessionProviderBinding| {
                 Ok(ResolvedProvider {
                     provider: std::sync::Arc::new(Blocking(gate.clone())),
-                    binding: ProviderBinding {
-                        version: binding.version,
+                    binding: ProviderModelBinding {
+                        binding_version: binding.binding_version,
                         provider_name: binding.provider_name.clone(),
                         provider_type: binding.provider_type.clone(),
                         protocol: binding.protocol.clone(),
@@ -3894,7 +3982,7 @@ mod tests {
         use latte_headless::provider::{
             FakeProvider, InputRequest, ProviderResponse, ProviderUsage,
         };
-        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+        use latte_headless::registry::{ProviderModelBinding, ResolvedProvider};
 
         let provider = std::sync::Arc::new(FakeProvider::scripted([
             ProviderResponse {
@@ -3922,8 +4010,8 @@ mod tests {
             std::sync::Arc::new(move |binding: &latte_core::SessionProviderBinding| {
                 Ok(ResolvedProvider {
                     provider: provider.clone(),
-                    binding: ProviderBinding {
-                        version: binding.version,
+                    binding: ProviderModelBinding {
+                        binding_version: binding.binding_version,
                         provider_name: binding.provider_name.clone(),
                         provider_type: binding.provider_type.clone(),
                         protocol: binding.protocol.clone(),
@@ -4027,18 +4115,20 @@ mod tests {
     #[cfg(unix)]
     fn process_reconciliation_state() -> Arc<ServerState> {
         use latte_headless::provider::{FakeProvider, ProviderResponse, ProviderUsage, ToolCall};
-        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+        use latte_headless::registry::{ProviderModelBinding, ResolvedProvider};
 
         let factory: latte_headless::session::SessionProviderFactory =
             std::sync::Arc::new(|binding: &latte_core::SessionProviderBinding| {
                 let provider = FakeProvider::scripted([
                     ProviderResponse {
-                        message: Some("attempting failed process".into()),
+                        message: Some("attempting uncertain write".into()),
                         tool_calls: vec![ToolCall {
-                            id: "failed-process".into(),
-                            name: "process".into(),
+                            id: "uncertain-write".into(),
+                            name: "write_file".into(),
                             input: serde_json::json!({
-                                "argv": ["/definitely-missing-latte-command"]
+                                "path": "readonly_dir/out.txt",
+                                "content": "x",
+                                "create_intent": true,
                             }),
                         }],
                         input_request: None,
@@ -4057,8 +4147,8 @@ mod tests {
                 ]);
                 Ok(ResolvedProvider {
                     provider: std::sync::Arc::new(provider),
-                    binding: ProviderBinding {
-                        version: binding.version,
+                    binding: ProviderModelBinding {
+                        binding_version: binding.binding_version,
                         provider_name: binding.provider_name.clone(),
                         provider_type: binding.provider_type.clone(),
                         protocol: binding.protocol.clone(),
@@ -4075,14 +4165,27 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn reconcile_effect_on_reconciliation_required_session_succeeds() {
-        // A process launch that fails after permission is granted leaves the
-        // session in ReconciliationRequired; reconciling the unknown effect
-        // returns 200 (covers the Ok arm of reconcile_effect).
+        use std::os::unix::fs::PermissionsExt;
+        // A write into an unwritable directory fails after Started and leaves
+        // the session in ReconciliationRequired; reconciling returns 200.
         let state = process_reconciliation_state();
         let workspace = tempfile::tempdir().unwrap();
+        let ro_dir = workspace.path().join("readonly_dir");
+        std::fs::create_dir(&ro_dir).unwrap();
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
         let (session_id, revision, request_id, turn_revision) =
             waiting_permission_session(&state, &workspace_id).await;
+
+        let (mode_status, mode_body) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/permission-mode"),
+            Some(serde_json::json!({ "permission_mode": "auto_edit" })),
+        )
+        .await;
+        assert_eq!(mode_status, StatusCode::OK);
+        assert_eq!(mode_body["permission_mode"], "auto_edit");
 
         // Grant permission; the launch fails and the session enters
         // ReconciliationRequired.
@@ -4416,65 +4519,26 @@ mod tests {
 
     #[test]
     fn recovery_sweep_interval_honors_env_override_and_default() {
-        // The recovery-sweep cadence defaults to 30s and can be shortened via
-        // LATTE_RECOVERY_SWEEP_MS (clamped to >=1ms) so E2E crash-recovery tests
-        // do not wait the full production interval. This exercises the parse /
-        // clamp / default branches directly without racing on process env by
-        // asserting the default in the common (unset) case.
-        //
-        // SAFETY: single-sessioned #[test]; we set and immediately clear the var
-        // within this test's own scope. No other test reads this variable.
-        let key = "LATTE_RECOVERY_SWEEP_MS";
-        let saved = std::env::var(key).ok();
-
-        // Run the sequence with the var unset first (the helper observes
-        // previous=None) and then pre-set (previous=Some), so both arms of the
-        // helper's restore match are exercised.
-        unsafe { std::env::remove_var(key) };
-        run_recovery_sweep_interval_sequence(key);
-        unsafe { std::env::set_var(key, "preset") };
-        run_recovery_sweep_interval_sequence(key);
-
-        match saved {
-            Some(value) => unsafe { std::env::set_var(key, value) },
-            None => unsafe { std::env::remove_var(key) },
-        }
-    }
-
-    fn run_recovery_sweep_interval_sequence(key: &str) {
-        let previous = std::env::var(key).ok();
-
-        unsafe { std::env::set_var(key, "250") };
         assert_eq!(
-            recovery_sweep_interval(),
+            parse_recovery_sweep_interval(Some("250")),
             std::time::Duration::from_millis(250)
         );
-
-        unsafe { std::env::set_var(key, "0") };
         assert_eq!(
-            recovery_sweep_interval(),
+            parse_recovery_sweep_interval(Some("0")),
             std::time::Duration::from_millis(1),
             "zero must clamp to at least 1ms"
         );
-
-        unsafe { std::env::set_var(key, "not-a-number") };
         assert_eq!(
-            recovery_sweep_interval(),
+            parse_recovery_sweep_interval(Some("not-a-number")),
             std::time::Duration::from_secs(30),
             "unparseable value falls back to the 30s default"
         );
-
-        unsafe { std::env::remove_var(key) };
         assert_eq!(
-            recovery_sweep_interval(),
+            parse_recovery_sweep_interval(None),
             std::time::Duration::from_secs(30),
             "unset value uses the 30s default"
         );
-
-        match previous {
-            Some(value) => unsafe { std::env::set_var(key, value) },
-            None => unsafe { std::env::remove_var(key) },
-        }
+        assert!(recovery_sweep_interval() >= std::time::Duration::from_millis(1));
     }
 
     #[tokio::test]
@@ -5122,5 +5186,130 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "rejected");
+    }
+
+    #[tokio::test]
+    async fn reconcile_effect_rejects_malformed_effect_id() {
+        let state = state();
+        let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
+        let overlong = "x".repeat(513);
+        let (status, body) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{session_id}/effects/{overlong}/reconcile"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "rejected");
+    }
+
+    #[tokio::test]
+    async fn rejected_and_replayed_requests_preserve_permission_mode_and_v1_wire_keys() {
+        let state = permission_state();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_id = create_workspace_id(&state, &workspace.path().to_string_lossy()).await;
+
+        // Invalid create carrying FullAuto must not pre-seed mode for that session_id.
+        let preset_sid = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
+        let mut bad_binding = valid_binding();
+        bad_binding["model"] = serde_json::json!("");
+        let (bad_status, _) = create_call(
+            &state,
+            &workspace_id,
+            serde_json::json!({
+                "session_id": preset_sid.to_string(),
+                "prompt": "bad",
+                "binding": bad_binding,
+                "permission_mode": "full_auto",
+            }),
+        )
+        .await;
+        assert_eq!(bad_status, StatusCode::BAD_REQUEST);
+
+        // Creating the same session_id without permission_mode must still start in Ask and park!
+        let (ok_status, _) = create_call(
+            &state,
+            &workspace_id,
+            serde_json::json!({
+                "session_id": preset_sid.to_string(),
+                "prompt": "write it",
+                "binding": valid_binding(),
+            }),
+        )
+        .await;
+        assert_eq!(ok_status, StatusCode::ACCEPTED);
+        let sid_str = preset_sid.to_string();
+        let mut parked_rev = None;
+        let mut req_id = String::new();
+        let mut turn_rev = 0;
+        for _ in 0..200 {
+            let (st, body) = call(&state, "GET", &format!("/v1/sessions/{sid_str}"), None).await;
+            if st == StatusCode::OK
+                && body["snapshot"]["lifecycle"].as_str() == Some("waiting_permission")
+            {
+                let snap = &body["snapshot"];
+                // Verify /v1 wire contract keys (#7).
+                assert!(snap.get("revision").is_some());
+                assert!(snap.get("session_revision").is_none());
+                assert_eq!(snap["permission_mode"], "ask");
+                assert!(snap["binding"].get("version").is_some());
+                assert!(snap["binding"].get("binding_version").is_none());
+                assert_eq!(snap["turns"][0]["ordinal"], 0);
+                assert!(snap["turns"][0].get("turn_ordinal").is_none());
+                parked_rev = snap["revision"].as_u64();
+                req_id = snap["pending"]["request_id"].as_str().unwrap().to_string();
+                turn_rev = snap["pending"]["expected_turn_revision"].as_u64().unwrap();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let parked_rev = parked_rev.expect("session must park in Ask mode");
+
+        // Stale/conflicting follow-up carrying FullAuto must return 409 AND leave session in Ask (#5).
+        let stale_cmd = latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()).to_string();
+        let (conflict_status, _) = call_with_headers(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{sid_str}/follow-up"),
+            Some(serde_json::json!({
+                "command_id": stale_cmd,
+                "prompt": "try escalate",
+                "expected_session_revision": parked_rev + 99,
+                "permission_mode": "full_auto",
+            })),
+            &[("idempotency-key", &stale_cmd)],
+        )
+        .await;
+        assert_eq!(conflict_status, StatusCode::CONFLICT);
+        let (_, after_conflict) =
+            call(&state, "GET", &format!("/v1/sessions/{sid_str}"), None).await;
+        assert_eq!(after_conflict["snapshot"]["permission_mode"], "ask");
+
+        // Deny current turn so session reaches terminal Failed, then check mode endpoint.
+        let (deny_status, _) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{sid_str}/permissions/{req_id}"),
+            Some(serde_json::json!({
+                "allow": false,
+                "expected_session_revision": parked_rev,
+                "expected_turn_revision": turn_rev,
+            })),
+        )
+        .await;
+        assert_eq!(deny_status, StatusCode::OK);
+        let (mode_status, mode_body) = call(
+            &state,
+            "POST",
+            &format!("/v1/sessions/{sid_str}/permission-mode"),
+            Some(serde_json::json!({ "permission_mode": "auto_edit" })),
+        )
+        .await;
+        assert_eq!(mode_status, StatusCode::OK);
+        assert_eq!(mode_body["permission_mode"], "auto_edit");
+        let (_, snap_after_mode) =
+            call(&state, "GET", &format!("/v1/sessions/{sid_str}"), None).await;
+        assert_eq!(snap_after_mode["snapshot"]["permission_mode"], "auto_edit");
     }
 }

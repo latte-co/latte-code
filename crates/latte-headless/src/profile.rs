@@ -22,9 +22,10 @@
 use std::sync::Arc;
 
 use latte_core::{
-    AGENT_SUMMARIZE_PROMPT_SLOT, AGENT_SYSTEM_PROMPT_SLOT, CompactionPolicy, CompactionStrategy,
-    ContextPolicy, GENERIC_OPENAI_CHAT_PROFILE_ID, HarnessProfile, ProfileVersion,
-    SessionProviderBinding, SystemPromptSpec, TokenEstimateParams,
+    AGENT_SUMMARIZE_PROMPT_SLOT, AGENT_SYSTEM_PROMPT_SLOT, ANTHROPIC_MESSAGES_PROFILE_ID,
+    CompactionPolicy, CompactionStrategy, ContextPolicy, GENERIC_OPENAI_CHAT_PROFILE_ID,
+    HarnessProfile, ProfileVersion, SessionProviderBinding, SystemPromptSpec, TokenEstimateParams,
+    ToolPresentationStyle,
 };
 use sha2::{Digest, Sha256};
 
@@ -45,7 +46,12 @@ pub enum ProfileError {
 /// The built-in system prompt template, identical to the pre-profile
 /// hardcoded prompt. `{repository_context}` is the injection point for the
 /// collected workspace context.
-const AGENT_SYSTEM_PROMPT_TEMPLATE: &str = "You are Latte Code, a coding agent making scoped changes to the repository described below. Work only within it: paths outside the workspace are rejected, and you cannot reach the network.\n\nRead before you write. To change an existing file, first call `read_file` on it and pass the `sha256` it returns as `precondition` to `edit_file` or `write_file`. A mutation without the digest of the version you actually read is rejected, and this holds again for every later edit to the same file: re-read to get the new digest. Prefer `edit_file`, whose `before` must match the file verbatim and occur exactly once; reach for `write_file` only to create a file or to rewrite one whole.\n\nUnderstand before you change. Locate the relevant code with `search` and `list_directory`, and read enough of it that your edit follows what is already there. `read_project_manifest` shows the language and dependencies. Do not invent APIs, dependencies, or file paths you have not observed.\n\nFinish what you start. After editing, check your own work with `git_diff`. When a verification command is configured it must pass before the task is complete; a failing, missing, or unrun verification means the work is unfinished. Report plainly what you changed and what you verified. If a tool call is rejected, read the error and correct the call rather than repeating it unchanged. If the task is ambiguous or you lack the means to finish it, say so instead of guessing.\n{repository_context}";
+const AGENT_SYSTEM_PROMPT_TEMPLATE: &str = "You are Latte Code, a coding agent making scoped changes to the repository described below. Work only within it: paths outside the workspace are rejected.\n\nRead before you write. To change an existing file, first call `read_file` on it (use `offset` and `limit` to paginate large files). The engine automatically records the `sha256` snapshot you read across consecutive edits, and also accepts that `sha256` as an optional `precondition` to `edit_file` or `write_file`; if an external process modifies the file on disk, re-read it first. Prefer `edit_file`, whose `before` must match the file verbatim and occur exactly once; use `write_file` to create new files (missing parent directories are created automatically) or replace an entire file.\n\nUnderstand before you change. Locate relevant code with `search` (`path`, `glob`) and `list_directory` (`max_depth`, `glob`), and read enough context that your edit matches existing conventions. `read_project_manifest` shows project manifests, and `process` runs commands inside the workspace (prefer `argv` over `shell`). Do not invent APIs, dependencies, or file paths you have not observed.\n\nFinish what you start. After editing, inspect your changes with `git_diff`. When a verification command is configured it must pass before the task is complete; a failing, missing, or unrun verification means the work is unfinished. Report concisely what you changed and verified. If a tool call returns an error, read the error and adjust your next call rather than repeating it unchanged. If the task is ambiguous or blocked, state why clearly instead of guessing.\n{repository_context}";
+
+/// The built-in Claude/Anthropic system prompt template aligned with the
+/// `ClaudeCode` tool presentation (`Read`, `Edit`, `Write`, `Glob`, `Grep`,
+/// `Bash`, `GitDiff`, `ReadManifest`).
+const AGENT_CLAUDE_SYSTEM_PROMPT_TEMPLATE: &str = "You are Latte Code, a coding agent making scoped changes to the repository described below. Work only within it: paths outside the workspace are rejected.\n\nRead before you write. To change an existing file, first call `Read` on it (`file_path`, with optional `offset` and `limit` to paginate large files). The engine automatically records the `sha256` snapshot you read across consecutive edits; if an external process modifies the file on disk, call `Read` again first. Prefer `Edit` (`file_path`, `old_string`, `new_string`, optional `replace_all`), where `old_string` must match uniquely unless `replace_all` is true; use `Write` (`file_path`, `content`) to create new files (missing parent directories are created automatically) or replace an entire file.\n\nUnderstand before you change. Locate relevant code with `Grep` (`pattern`, `path`, `glob`) and `Glob` (`pattern`, `path`), and read enough context that your edit matches existing conventions. `ReadManifest` shows project manifests, and `Bash` (`command`, optional `cwd`, `timeout_ms`) runs commands inside the workspace. Do not invent APIs, dependencies, or file paths you have not observed.\n\nFinish what you start. After editing, inspect your changes with `GitDiff`. When a verification command is configured it must pass before the task is complete; a failing, missing, or unrun verification means the work is unfinished. Report concisely what you changed and verified. If a tool call returns an error, read the error and adjust your next call rather than repeating it unchanged. If the task is ambiguous or blocked, state why clearly instead of guessing.\n{repository_context}";
 
 /// Provider types recognized by the built-in catalog. `embedded` covers the
 /// in-process test fixture binding and `test` covers the crate-local session
@@ -54,7 +60,7 @@ const AGENT_SYSTEM_PROMPT_TEMPLATE: &str = "You are Latte Code, a coding agent m
 /// verbatim (including `provider_type`), so every type that could have been
 /// persisted by any previous release must resolve here or old sessions fail
 /// to reopen.
-const BUILTIN_PROVIDER_TYPES: [&str; 3] = ["openai-chat", "embedded", "test"];
+const BUILTIN_PROVIDER_TYPES: [&str; 4] = ["openai-chat", "anthropic-messages", "embedded", "test"];
 
 /// The provider type used for eager, binding-free pre-checks (prompt budget
 /// validation before enqueue). Every built-in profile shares the same prompt
@@ -67,26 +73,16 @@ const DEFAULT_BUILTIN_PROVIDER_TYPE: &str = "openai-chat";
 /// discarded transcript plain text.
 const AGENT_SUMMARIZE_PROMPT_TEMPLATE: &str = "You are compacting the earlier history of a coding-agent conversation that no longer fits its request budget. Produce a terse factual summary of the transcript below so a fresh model instance can continue the work without the original turns.\n\nPreserve, in this priority order: the user's goal and any corrections to it; every decision made and its reason; every file path, command, and verification result that is still relevant; open questions and unfinished work. Omit small talk, retries, and superseded attempts. Do not invent anything that is not in the transcript. The transcript may contain an earlier `[compacted summary]` block: treat it as a prior checkpoint, merge it into one consolidated summary — preserve still-true facts and drop stale ones — and never copy it verbatim. Reply with the summary only.\n\nTranscript:\n";
 
-fn builtin_profile(provider_type: &str) -> Result<HarnessProfile, ProfileError> {
-    if !BUILTIN_PROVIDER_TYPES.contains(&provider_type) {
-        return Err(ProfileError::UnknownProviderType {
-            provider_type: provider_type.to_owned(),
-        });
-    }
-    let context = ContextPolicy {
-        max_request_bytes: 512 * 1024,
-        max_input_bytes: 384 * 1024,
-        reserved_output_bytes: 128 * 1024,
-        context_cap_bytes: 64 * 1024,
-        max_tool_rounds: None,
-        provider_timeout_ms: 60_000,
-        ..ContextPolicy::default()
+fn prompts_for_style(style: ToolPresentationStyle) -> SystemPromptSpec {
+    let system_template = match style {
+        ToolPresentationStyle::Canonical => AGENT_SYSTEM_PROMPT_TEMPLATE,
+        ToolPresentationStyle::ClaudeCode => AGENT_CLAUDE_SYSTEM_PROMPT_TEMPLATE,
     };
-    let prompts = SystemPromptSpec {
+    SystemPromptSpec {
         slots: [
             (
                 AGENT_SYSTEM_PROMPT_SLOT.to_owned(),
-                AGENT_SYSTEM_PROMPT_TEMPLATE.to_owned(),
+                system_template.to_owned(),
             ),
             (
                 AGENT_SUMMARIZE_PROMPT_SLOT.to_owned(),
@@ -95,12 +91,32 @@ fn builtin_profile(provider_type: &str) -> Result<HarnessProfile, ProfileError> 
         ]
         .into_iter()
         .collect(),
-    };
+    }
+}
+
+fn builtin_profile(provider_type: &str) -> Result<HarnessProfile, ProfileError> {
+    if !BUILTIN_PROVIDER_TYPES.contains(&provider_type) {
+        return Err(ProfileError::UnknownProviderType {
+            provider_type: provider_type.to_owned(),
+        });
+    }
+    if provider_type == "anthropic-messages" {
+        let mut context = ContextPolicy::default();
+        context.compaction.reuse_prefix = true;
+        return Ok(HarnessProfile {
+            profile_id: ANTHROPIC_MESSAGES_PROFILE_ID.to_owned(),
+            version: ProfileVersion::V1_1,
+            context,
+            prompts: prompts_for_style(ToolPresentationStyle::ClaudeCode),
+            tools: ToolPresentationStyle::ClaudeCode,
+        });
+    }
     Ok(HarnessProfile {
         profile_id: GENERIC_OPENAI_CHAT_PROFILE_ID.to_owned(),
         version: ProfileVersion::V1_0,
-        context,
-        prompts,
+        context: ContextPolicy::default(),
+        prompts: prompts_for_style(ToolPresentationStyle::Canonical),
+        tools: ToolPresentationStyle::Canonical,
     })
 }
 
@@ -156,7 +172,10 @@ fn layer_budget(builtin: &ContextPolicy, base: &ContextPolicy) -> ContextPolicy 
         compaction: if matches!(base.compaction.strategy, CompactionStrategy::Off) {
             builtin.compaction.clone()
         } else {
-            base.compaction.clone()
+            CompactionPolicy {
+                reuse_prefix: base.compaction.reuse_prefix || builtin.compaction.reuse_prefix,
+                ..base.compaction.clone()
+            }
         },
         token_estimate: builtin.token_estimate.clone(),
     }
@@ -241,6 +260,7 @@ impl ProfileCatalog {
                 version: builtin.version,
                 context,
                 prompts: builtin.prompts,
+                tools: builtin.tools,
             },
         })
     }
@@ -270,6 +290,16 @@ impl ProfileCatalog {
                 (window as usize).saturating_mul(context.token_estimate.bytes_per_token);
             context.context_cap_bytes = context.context_cap_bytes.min(derived_cap);
         }
+        let tools = self
+            .registry
+            .as_ref()
+            .and_then(|registry| registry.provider_tool_presentation(&binding.provider_name))
+            .unwrap_or(builtin.tools);
+        let prompts = if tools == builtin.tools {
+            builtin.prompts
+        } else {
+            prompts_for_style(tools)
+        };
         context.validate().map_err(|reason| ProfileError::Invalid {
             profile_id: builtin.profile_id.clone(),
             reason,
@@ -279,7 +309,8 @@ impl ProfileCatalog {
                 profile_id: builtin.profile_id,
                 version: builtin.version,
                 context,
-                prompts: builtin.prompts,
+                prompts,
+                tools,
             },
         })
     }
@@ -350,6 +381,12 @@ impl ResolvedProfile {
             })
     }
 
+    /// The profile's wire-level tool presentation style.
+    #[must_use]
+    pub fn tool_presentation(&self) -> ToolPresentationStyle {
+        self.profile.tools
+    }
+
     /// Stable content fingerprint of the resolved profile data. Equal
     /// fingerprints guarantee equal behavioral parameters.
     #[must_use]
@@ -361,6 +398,7 @@ impl ResolvedProfile {
                 "minor": self.profile.version.minor,
             },
             "context": self.profile.context,
+            "tools": self.profile.tools,
         });
         let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
         let mut hasher = Sha256::new();
@@ -385,7 +423,7 @@ mod tests {
 
     fn binding(provider_type: &str, model: &str) -> SessionProviderBinding {
         SessionProviderBinding {
-            version: 2,
+            binding_version: 2,
             provider_name: "main".into(),
             provider_type: provider_type.into(),
             protocol: "openai-chat".into(),
@@ -447,8 +485,8 @@ mod tests {
         let large = catalog
             .resolve(&binding("openai-chat", "large"))
             .expect("resolves");
-        // 1_000_000 tokens * 4 > 64 KiB default: cap stays, never widens.
-        assert_eq!(large.history_policy().context_cap_bytes, 64 * 1024);
+        // 1_000_000 tokens * 4 > 128 KiB default: cap stays, never widens.
+        assert_eq!(large.history_policy().context_cap_bytes, 128 * 1024);
     }
 
     #[test]
@@ -647,7 +685,7 @@ mod tests {
         assert!(prompt.ends_with("\nREPOSITORY-CONTEXT"));
         // The read-before-mutate rule must survive the move into the slot.
         assert!(prompt.contains("first call `read_file` on it"));
-        assert!(prompt.contains("`sha256` it returns as `precondition`"));
+        assert!(prompt.contains("`precondition`"));
         assert!(!prompt.contains("{repository_context}"));
         assert_eq!(
             resolved.system_prompt("").expect("slot exists"),
@@ -667,5 +705,44 @@ mod tests {
         let fingerprint = first.fingerprint();
         assert_eq!(fingerprint.len(), 64);
         assert!(fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn anthropic_messages_profile_aligns_claude_tool_presentation_and_warm_prefix_compaction() {
+        let reg = registry(
+            "{version:1,default_model:'claude/seed',providers:{claude:{type:'anthropic-messages',models:['seed'],base_url:'http://127.0.0.1:8317',api_key:'k'},oai_claude:{type:'openai-chat',models:['m'],endpoint:'http://127.0.0.1:9',api_key:'k',tool_style:'claude_code'}}}",
+        );
+        let base = ContextPolicy {
+            compaction: CompactionPolicy {
+                strategy: CompactionStrategy::ElideToolResultsThenSummarize,
+                ..CompactionPolicy::default()
+            },
+            ..ContextPolicy::default()
+        };
+        let cat = catalog(base, reg);
+        let mut anth_binding = binding("anthropic-messages", "seed");
+        anth_binding.provider_name = "claude".into();
+        let resolved = cat.resolve(&anth_binding).expect("resolves");
+        assert_eq!(resolved.profile().profile_id, ANTHROPIC_MESSAGES_PROFILE_ID);
+        assert_eq!(resolved.profile().version, ProfileVersion::V1_1);
+        assert_eq!(
+            resolved.tool_presentation(),
+            ToolPresentationStyle::ClaudeCode
+        );
+        assert!(resolved.compaction().reuse_prefix);
+        let prompt = resolved.system_prompt("").expect("slot exists");
+        for needle in ["`Read`", "`Edit`", "`Write`", "`Glob`", "`Grep`", "`Bash`"] {
+            assert!(prompt.contains(needle), "missing {needle}");
+        }
+
+        // An openai-chat provider with explicit `tool_style: "claude_code"` swaps prompt + tools coherently.
+        let mut oai_binding = binding("openai-chat", "m");
+        oai_binding.provider_name = "oai_claude".into();
+        let overridden = cat.resolve(&oai_binding).expect("resolves");
+        assert_eq!(
+            overridden.tool_presentation(),
+            ToolPresentationStyle::ClaudeCode
+        );
+        assert!(overridden.system_prompt("").unwrap().contains("`Edit`"));
     }
 }

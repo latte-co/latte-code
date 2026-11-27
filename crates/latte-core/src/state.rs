@@ -238,31 +238,6 @@ pub enum TransitionError {
     RevisionOverflow,
 }
 
-/// Stable process exit classifications for headless callers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HeadlessOutcome {
-    Success,
-    Failed,
-    Interrupted,
-    Cancelled,
-    UsageError,
-    InternalError,
-}
-
-impl HeadlessOutcome {
-    /// Maps outcomes to stable process exit codes.
-    #[must_use]
-    pub const fn exit_code(self) -> u8 {
-        match self {
-            Self::Success => 0,
-            Self::Failed => 1,
-            Self::UsageError => 2,
-            Self::Interrupted | Self::Cancelled => 130,
-            Self::InternalError => 70,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,15 +528,5 @@ mod tests {
                 from: TurnStatus::Queued
             })
         );
-    }
-
-    #[test]
-    fn all_headless_outcomes_have_stable_process_exit_codes() {
-        assert_eq!(HeadlessOutcome::Success.exit_code(), 0);
-        assert_eq!(HeadlessOutcome::Failed.exit_code(), 1);
-        assert_eq!(HeadlessOutcome::UsageError.exit_code(), 2);
-        assert_eq!(HeadlessOutcome::Interrupted.exit_code(), 130);
-        assert_eq!(HeadlessOutcome::Cancelled.exit_code(), 130);
-        assert_eq!(HeadlessOutcome::InternalError.exit_code(), 70);
     }
 }

@@ -234,17 +234,6 @@ fn completion_policy_prevents_false_success() {
 
 #[test]
 fn protocol_json_is_exact() {
-    let envelope = CommandEnvelope::new(CommandId::from_uuid(Uuid::nil()), RuntimeCommand::List);
-    assert_eq!(
-        serde_json::to_string(&envelope).unwrap(),
-        r#"{"protocol_version":1,"command_id":"00000000-0000-0000-0000-000000000000","command":{"type":"list"}}"#
-    );
-    assert_eq!(
-        serde_json::from_str::<CommandEnvelope>(&serde_json::to_string(&envelope).unwrap())
-            .unwrap(),
-        envelope
-    );
-
     let event = EventEnvelope {
         protocol_version: PROTOCOL_VERSION,
         event_id: EventId::from_uuid(Uuid::nil()),
@@ -263,25 +252,35 @@ fn protocol_json_is_exact() {
         event
     );
 
-    let read_model = ReadModelEnvelope {
-        protocol_version: PROTOCOL_VERSION,
-        turn: TurnState::queued(id()),
-    };
+    let state = TurnState::queued(id());
     assert_eq!(
-        serde_json::to_string(&read_model).unwrap(),
-        r#"{"protocol_version":1,"turn":{"turn_id":"00000000-0000-0000-0000-000000000000","revision":0,"status":"queued","pending_permission":null,"pending_input":null,"failure":null,"handoff":null}}"#
+        serde_json::to_string(&state).unwrap(),
+        r#"{"turn_id":"00000000-0000-0000-0000-000000000000","revision":0,"status":"queued","pending_permission":null,"pending_input":null,"failure":null,"handoff":null}"#
     );
+    // Read-only compatibility: a pre-schema-15 payload keyed "run_id" must
+    // still deserialize into the renamed `TurnState`.
+    let legacy_json = r#"{"run_id":"00000000-0000-0000-0000-000000000000","revision":0,"status":"queued","pending_permission":null,"pending_input":null,"failure":null,"handoff":null}"#;
     assert_eq!(
-        serde_json::from_str::<ReadModelEnvelope>(&serde_json::to_string(&read_model).unwrap())
-            .unwrap(),
-        read_model
+        serde_json::from_str::<TurnState>(legacy_json).unwrap(),
+        state
     );
-    // Read-only compatibility: a pre-schema-15 payload keyed "run" with
-    // "run_id" must still deserialize into the renamed types.
-    let legacy_json = r#"{"protocol_version":1,"run":{"run_id":"00000000-0000-0000-0000-000000000000","revision":0,"status":"queued","pending_permission":null,"pending_input":null,"failure":null,"handoff":null}}"#;
+
+    // Read-only compatibility for Batch 3 renamed keys (`revision`, `ordinal`, `version`).
+    let turn_summary: SessionTurnSummary = serde_json::from_str(
+        r#"{"run_id":"00000000-0000-0000-0000-000000000000","parent_run_id":null,"ordinal":2,"status":"completed","run_revision":4,"completed_at_ms":10}"#,
+    )
+    .unwrap();
+    assert_eq!(turn_summary.turn_ordinal, 2);
+    assert_eq!(turn_summary.turn_revision, 4);
+
+    let compact_state: ManualCompactionState =
+        serde_json::from_str(r#"{"compacted":{"tier":"summarized","revision":9}}"#).unwrap();
     assert_eq!(
-        serde_json::from_str::<ReadModelEnvelope>(legacy_json).unwrap(),
-        read_model
+        compact_state,
+        ManualCompactionState::Compacted {
+            tier: ManualCompactionTier::Summarized,
+            session_revision: 9,
+        }
     );
 }
 
@@ -310,14 +309,4 @@ fn clock_and_id_generation_are_deterministic_and_v7() {
     );
     let source = FixedIds(generated);
     assert_eq!(source.next_uuid_v7(), source.next_uuid_v7());
-}
-
-#[test]
-fn exit_mapping_is_stable() {
-    assert_eq!(HeadlessOutcome::Success.exit_code(), 0);
-    assert_eq!(HeadlessOutcome::Failed.exit_code(), 1);
-    assert_eq!(HeadlessOutcome::UsageError.exit_code(), 2);
-    assert_eq!(HeadlessOutcome::InternalError.exit_code(), 70);
-    assert_eq!(HeadlessOutcome::Interrupted.exit_code(), 130);
-    assert_eq!(HeadlessOutcome::Cancelled.exit_code(), 130);
 }

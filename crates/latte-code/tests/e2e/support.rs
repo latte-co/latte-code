@@ -21,7 +21,12 @@ use std::{
 pub const REVERSE_TO_SCHEMA_12_SQL: &str = r"
     PRAGMA foreign_keys=OFF;
     PRAGMA legacy_alter_table=OFF;
-    -- Undo schema 15 (turn→run) first.
+    -- Undo schema 16 first.
+    ALTER TABLE sessions DROP COLUMN permission_mode;
+    ALTER TABLE sessions DROP COLUMN create_command_id;
+    ALTER TABLE sessions DROP COLUMN create_command_digest;
+    ALTER TABLE turn_baselines DROP COLUMN captured;
+    -- Undo schema 15 (turn→run).
     ALTER TABLE sessions RENAME COLUMN latest_turn_id TO latest_run_id;
     ALTER TABLE session_effect_canonical RENAME COLUMN turn_id TO run_id;
     ALTER TABLE conversation_outbox RENAME COLUMN turn_id TO run_id;
@@ -60,7 +65,7 @@ pub const REVERSE_TO_SCHEMA_12_SQL: &str = r"
     ALTER TABLE session_active_runs RENAME TO thread_active_runs_v2;
     ALTER TABLE session_runs RENAME TO thread_runs_v2;
     ALTER TABLE sessions RENAME TO threads_v2;
-    DELETE FROM schema_migrations WHERE version IN (13,14,15);
+    DELETE FROM schema_migrations WHERE version IN (13,14,15,16);
 ";
 
 pub struct Scenario {
@@ -858,6 +863,14 @@ impl PtySession {
 
     pub fn is_running(&mut self) -> bool {
         self.child.as_mut().unwrap().try_wait().unwrap().is_none()
+    }
+
+    pub fn send_sigint(&self) {
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(self.process_group),
+            nix::sys::signal::Signal::SIGINT,
+        )
+        .unwrap();
     }
 
     pub fn finish(mut self, timeout: Duration) -> (std::process::ExitStatus, Vec<u8>) {

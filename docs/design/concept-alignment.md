@@ -1,12 +1,15 @@
 # Latte Code 概念体系对齐
 
-状态：**批次 0-2 已落地，批次 3/4 待启动。** 批次 0（文档与死代码清理）、批次 1
+状态：**批次 0-4 已全部落地。** 批次 0（文档与死代码清理）、批次 1
 （`Thread → Session`，schema 13：drop v1 死表、v2 表去前缀改名、幂等 digest 与
 验证 effect 前缀的升级兼容桥、binding 指纹兼容）与批次 2（`Run → Turn`，schema 14
 持久轮次计数 `tool_round_count` + schema 15 物理图改名；线协议硬改名，旧数据经
-serde alias 与 legacy import 只读兼容）均已随 PR #17 落地。实施细节、影响面统计与
-当时的取证见该 PR 与 git 历史；本文保留仍然有效的规范层级、术语表、关键决策与
-剩余工作，已落地部分以当前代码为权威。
+serde alias 与 legacy import 只读兼容）已随 PR #17 落地；批次 3（`RoundId`、`EffectId`、
+`EffectAuthority`/`EffectView`、`ProjectKey`、`ProviderModelBinding`、`binding_version`、
+`session_revision`、`turn_ordinal`/`call_ordinal`、`effect_stage_marker`、
+`ActiveSession::SessionDraft`）与批次 4（三维状态文档化、TUI 区分 `Permission denied` /
+`Cancelled` / `Last turn failed · ready`、CLI `unclassified` 与 `idempotency_mismatch`、
+死 v1 命令/信封类型退役且保留 `reject_linked_turn` 守卫）已全部实现并通过契约测试守护。
 
 ---
 
@@ -25,14 +28,14 @@ Workspace                    工作区：一个文件系统根
      │
      └─ Turn                 轮次：一次用户提交及其完整 Provider/Tool 循环
         │                    实现：Turn / TurnId / turns（schema 15 改名）
-        │                    完成后不可变，按 ordinal 串成链
+        │                    完成后不可变，按 turn_ordinal 串成链
         │
         └─ Round             回合：Turn 内一次 assistant tool 调用批次
-           │                 实现：无类型，靠 (entry.sequence, ordinal) 元组反查；
+           │                 实现：RoundId(u64) / ToolRound / ToolRoundPosition；
            │                 轮次数由持久计数器 tool_round_count 累计（schema 14）
            │
            └─ Call → Effect  单次工具调用，及其特权执行凭据
-                             实现：ToolCall（provider 侧）/ effect_id: String
+                             实现：ToolCall（provider 侧）/ EffectId + EffectAuthority（引擎私有）/ EffectView（脱敏投影）
 ```
 
 层级判据：
@@ -41,11 +44,11 @@ Workspace                    工作区：一个文件系统根
   fork 产生新 Session 并记录 `parent_session_id`。
 - **Turn** 是一次「你说、它做完」。follow-up 产生新 Turn，同 Session。
   `SessionLifecycle` 挂在 Session 上，实际是 active Turn 状态的投影。
-- **Round** 是 Turn 内一次 provider 往返所产生的 tool 调用批次。它是真实存在的
-  执行单元（`handle_provider_tool_round` / `execute_tool_batch`），但没有类型，
-  身份从 transcript 反查（`tool_round_for_call`）。一个 Turn 已完成多少个 Round
-  由持久计数器 `session_turns.tool_round_count` 权威记录；预算检查只发生在「还要
-  再开一个工具批次」时，input 回答与权限批准不会重置计数。
+- **Round** 是 Turn 内一次 provider 往返所产生的 tool 调用批次，由强类型
+  `RoundId(u64)`、`ToolRound` 与 `ToolRoundPosition` 表达（Assistant 工具轮卡片显式
+  持久化 `"round_id"`，旧卡片兼容回退到 `entry.sequence`）。一个 Turn 已完成多少个
+  Round 由持久计数器 `session_turns.tool_round_count` 权威记录；预算检查只发生在
+  「还要再开一个工具批次」时，input 回答与权限批准不会重置计数。
 
 ## 2. 术语表
 
@@ -54,32 +57,31 @@ Workspace                    工作区：一个文件系统根
 | 规范术语 | 定义 | 当前实现 |
 | --- | --- | --- |
 | Workspace | 一个文件系统根，会话的归属边界 | `workspace_root: String` ✓ |
-| Project | 共享同一 git common dir 的 Workspace 分组 | `project_key`（仅存于 SQL，core 层缺席） |
+| Project | 共享同一 git common dir 的 Workspace 分组 | `ProjectKey` / `ProjectSummary` / `SessionSummary.project_key` ✓ |
 | Session | 一次持久对话 | `Session` / `SessionId` / `sessions` ✓ |
 | Turn | Session 内一次用户提交及其完整循环 | `Turn` / `TurnId` / `turns` ✓ |
-| Round | Turn 内一次 assistant tool 调用批次 | *无类型* |
-| Call | Round 内单次工具调用 | `ToolCall`（provider 侧）✓ |
-| Effect | 一次特权操作的持久凭据与生命周期 | `effect_id: String`（无类型） |
+| Round | Turn 内一次 assistant tool 调用批次 | `RoundId` / `ToolRound` / `ToolRoundPosition` ✓ |
+| Call | Round 内单次工具调用 | `ToolCall`（provider 侧，`call_ordinal`）✓ |
+| Effect | 一次特权操作的持久凭据与生命周期 | `EffectId` / `SessionEffectKind` / `EffectAuthority`（权威）+ `EffectView`（展示）✓ |
 | Transcript | Session 的 append-only 卡片流 | `TranscriptPage` ✓ / *表名 `conversation_outbox`* |
-| Binding | Session 绑定的 provider + model + 指纹 | *`ProviderBinding` 与 `SessionProviderBinding` 同名不同物* |
+| Binding | Session 绑定的 provider + model + 指纹 | `ProviderModelBinding`（模型侧）与 `SessionProviderBinding`（含 `binding_version`）✓ |
 | Lease | 执行权威的租约与 fencing token | `Lease` ✓ |
-| Verification | 变更后的验证及其证据 | *`Evidence` / `VerificationEvidence` / `VerificationRecord` 三类型同概念* |
-| Reconciliation | `Unknown` effect 的显式对账 | ✓ 全库一致，无需改动 |
+| Verification | 变更后的验证及其证据 | `Evidence` / `VerificationStatus` ✓ |
+| Reconciliation | `Unknown` effect 的显式对账 | ✓ 全库一致 |
 
-### 2.1 需要消歧的复用词
+### 2.1 已完成消歧的复用词
 
-以下单词在不同层级重复使用，含义不同。规范做法：**加层级前缀**。批次 2 已完成
-run/turn 维度的消歧，其余仍待批次 3/4。
+以下单词在不同层级重复使用，含义不同。规范做法：**加层级前缀**。批次 2-4 已全部完成消歧：
 
-| 词 | 多重含义 | 建议 / 状态 |
+| 词 | 多重含义 | 当前状态 |
 | --- | --- | --- |
-| `revision` | Turn revision（`SessionTurnSummary.turn_revision`）/ Session 快照裸字段 `revision` | turn 侧已加前缀为 `turn_revision`（批次 2）；线协议参数为 `expected_session_revision` / `expected_turn_revision`。session 级裸 `revision` 留待批次 3 统一为 `session_revision` |
-| `sequence` | transcript seq / snapshot seq / event seq（三者同源）/ v1 RuntimeEvent seq（独立） | 前三者保留 `sequence`；v1 事件序列仍按批次 4 的 v1 退役处理 |
-| `ordinal` | Session 内 Turn 序号（`SessionTurnSummary.ordinal`）/ Round 内 Call 下标 | 建议 `turn_ordinal` / `call_ordinal`，留待批次 3 随 `Round` 类型一起落地 |
-| `checkpoint` | v1 协调者自定义恢复负载 / v2 引擎生成的 effect 阶段标记 | 后者建议改 `effect_stage_marker`，待批次 3 |
-| `catalog` | Session catalog / Workspace catalog / Model catalog / Command catalog | 保留但强制加限定词，禁止裸用 |
-| `draft` | 会话草稿 `NewSessionDraft` / 模型预选 `draft_model` / 输入暂存 `deferred_composer_draft` | `session_draft` / `pending_model_selection` / `deferred_composer_text`，待批次 3 |
-| `failed` | HTTP 层 = 500 内部错误 / CLI 层 = 非 5xx 兜底 | **含义相反，必须改**：CLI 侧改 `unclassified`，批次 4 处理 |
+| `revision` | Turn revision（`SessionTurnSummary.turn_revision`）/ Session 快照修订（`session_revision`） | 已统一为 `turn_revision` 与 `session_revision`（含 `SessionSnapshot`、`SessionEventEnvelope`、`ManualCompactionState::Compacted` 与 SSE `session_changed`，带 `#[serde(alias = "revision")]` 读取兼容）✓ |
+| `sequence` | transcript seq / snapshot seq / event seq（三者同源） | 保留 `sequence`；死 v1 命令/信封类型已退役 ✓ |
+| `ordinal` | Session 内 Turn 序号 / Round 内 Call 下标 | 已拆分为 `SessionTurnSummary.turn_ordinal`（带 `alias = "ordinal"`）与 `call_ordinal` ✓ |
+| `checkpoint` | v1 协调者自定义恢复负载 / v2 引擎生成的 effect 阶段标记 | v2 侧已更名为 `effect_stage_marker`（`session_effect_stage_marker` / `effect_stage_marker_json`）✓ |
+| `catalog` | Session catalog / Workspace catalog / Model catalog / Command catalog | 保留并强制加限定词，禁止裸用 ✓ |
+| `draft` | 会话草稿 / 模型预选 / 输入暂存 | 已统一为 `ActiveSession::SessionDraft`、`pending_model_selection` 与 `deferred_composer_text` ✓ |
+| `failed` | HTTP 层 = 500 内部错误 / CLI 层 = 非 5xx 兜底 | CLI 侧已更名为 `ClientError::Unclassified`（`code = "unclassified"`），并补齐 422 `ClientError::IdempotencyMismatch`（`code = "idempotency_mismatch"`）✓ |
 
 ## 3. 关键决策：改名与守卫退役必须分开
 
@@ -95,34 +97,27 @@ run/turn 维度的消歧，其余仍待批次 3/4。
 - **守卫退役的前置条件（未来独立批次）**：证明 v1 直连操作面已无任何生产调用方，
   再删除守卫与其错误类型；或引入真正的类型区分（session-bound turn 的新类型）。
   这属于安全边界收缩，需要独立的调用面审计与回归，不能搭车改名。
-- v1 的实际存活范围：v1 CLI/RPC 命令入口已死（`--allow`/`--deny` 是硬错误）；
-  物理 turn 图（`turns` 表与状态/事件行）与 `RuntimeEvent` 类型仍活——每次 turn
-  状态迁移都写一行 `RuntimeEvent`，session 工作流直接依赖。`RuntimeCommand` 一侧
-  无外部生产调用方，其最终退役属于批次 4。
+- v1 的实际存活范围：v1 CLI/RPC 命令入口与无调用方的死类型（`CommandId`、
+  `CommandEnvelope`、`ReadModelEnvelope`、`RuntimeCommand`、`PermissionDecision`、
+  `HeadlessOutcome` 以及无生产写入的 `RuntimeEvent::{ToolStarted, ToolCompleted,
+  EvidenceRecorded}`）已在批次 4 退役；物理 turn 图（`turns` 表与状态/事件行）及
+  `RuntimeEvent::StateChanged` 仍活——每次 turn 状态迁移都写一行 `RuntimeEvent`，
+  session 工作流直接依赖。
 
-## 4. 剩余批次
+## 4. 批次 3 与批次 4 落地记录
 
-### 批次 3：结构性补强（未启动）
+### 批次 3：结构性补强（已落地）
 
-1. **Round 无类型**——身份是 `(transcript_entry.sequence, ordinal)` 元组，从
-   payload 反序列化恢复（`tool_round_for_call`）。建议引入 `RoundId` 或至少一个
-   `Round` 结构；`RoundId` 应先于任何改变 transcript sequence 语义的新特性落地。
-2. **`effect_id` 是 String**——隐含结构
-   `session-effect:{turn_id}:{round_sequence}:{ordinal}:{tool_call_id}` 无解析器，
-   与全库 `typed_id!` 惯例不一致。
-3. **`SessionEffectDescriptor` 与 `SessionEffectPresentation` 字段完全同构**，
-   仅靠是否脱敏区分，名字上分不出哪个是可执行权威。建议改名体现信任级别，如
-   `EffectAuthority` / `EffectView`。
-4. **Project 在 core 层缺席**——会话摘要只到 `workspace_root`，无 `project_key`，
-   跨 worktree 归属只存在于 SQL 外键。
-5. **`SessionProviderBinding` 双版本号**——字段 `version: u32` 指 binding 自身
-   版本（`BINDING_VERSION = 1`），读名字容易误解为会话协议版本。
-6. **session 级裸 `revision`**——快照结构内 session 修订仍是裸字段，turn 侧已在
-   批次 2 加前缀；建议对称改为 `session_revision`。
+1. **`RoundId(u64)` 与 `ToolRound`**：Assistant 工具轮卡片显式持久化 `"round_id"`，旧卡片兼容回退到 `entry.sequence`；`ToolRoundPosition` 使用 `call_ordinal` / `start_call_ordinal`。
+2. **`EffectId` 与 `SessionEffectKind`**：1..=512 字节无控制字符校验类型，统一解析 `session-effect:` / `session-verification:`（兼容旧 `thread-*` 前缀）。
+3. **`EffectAuthority` 与 `EffectView`**：`EffectAuthority` 仅存于引擎私有 `session_effect_canonical`，公开列 `effects.descriptor_json` 与 transcript 只写经 `EffectView::from_authority` 脱敏后的视图。
+4. **`ProjectKey` 与 `ProjectSummary`**：进入 `latte-core`，并在 `SessionSummary.project_key` 与 `EngineHandle::project_key()` 暴露跨 worktree 逻辑仓库归属。
+5. **`SessionProviderBinding.binding_version`**：消除与协议版本号的歧义（`#[serde(alias = "version")]`），幂等创建去重同时兼容新旧 digest。
+6. **`session_revision`、`turn_ordinal`、`effect_stage_marker` 与 `ActiveSession`**：完成快照/SSE/压缩状态/TUI 模型字段的全面前缀化与消歧。
 
-### 批次 4：状态与错误词汇对齐（未启动）
+### 批次 4：状态与错误词汇对齐（已落地）
 
-当前系统实际存在三个独立维度，各自回答不同问题：
+系统显式区分三个正交状态维度：
 
 1. **会话是否还能继续（`SessionLifecycle`，持久投影）**——`ready` 表示「会话可以
    接收下一个 turn」，不是「上一个 turn 成功」。`lifecycle=ready` 时最新 turn 可能
@@ -130,28 +125,18 @@ run/turn 维度的消歧，其余仍待批次 3/4。
 2. **最后一个 turn 的结局（`SessionTurnSummary.status` + `failure_code`）**——
    与维度 1 回答的问题不同：一个问「会话能否继续」，一个问「刚才那次结果如何」。
 3. **本次 CLI 调用的进程结局（`TerminalOutcome`，仅 CLI 侧）**——`classify()` 把
-   前两个维度合成进程退出分类。因此
-   `{"status":"denied", "data":{"session":{"lifecycle":"ready"}}}` **不是自相
-   矛盾**。批次 4 的工作：(a) 在 HTTP/CLI/文档里明确两个字段分属两个维度，避免
-   读者把 ready 读成成功；(b) TUI 补 denied / cancelled 的可见表达；(c) CLI 侧的
-   合成规则显式文档化。
+   前两个维度合成进程退出分类。
 
-仍待本批处理的具体缺陷：
-
-- HTTP `rejected` → CLI `usage`、HTTP `failed` → CLI `internal` 的映射中，字符串
-  `failed` 在两层含义相反，CLI 侧建议改 `unclassified`。
-- `idempotency_mismatch`(422) 在 CLI 侧无映射分支，退化为 code `failed`。
-- core 中 v1 状态/事件类型（`RuntimeEvent` / `RuntimeCommand` / `TurnStatus` 的
-  v1 读写路径）的最终退役属于本批。
+本批已完成：
+- TUI 顶栏、底部状态栏、Turn 标题与 `Failure` 卡片显式区分 `Permission denied`、`Cancelled` 与 `Last turn failed · ready`。
+- CLI `ClientError` 将非 5xx 未知错误更名为 `Unclassified`（`code = "unclassified"`），并为 HTTP 422 新增 `IdempotencyMismatch`（`code = "idempotency_mismatch"`）。
+- 退役全部死 v1 信封与命令类型，同时原样保留 `reject_linked_turn` / `LinkedTurnRequiresSessionCommit` 权限守卫。
 
 ## 5. 遗留决策点
 
-### 5.1 是否引入 `Conversation` 作为第三层名词
+### 5.1 `Conversation` 术语边界（已收敛）
 
-`conversation` 仍在 TUI 与类型名中与 session 混用（`/new` 命令描述、分组标题、
-`ActiveConversation` 类型）。决策方向是**废弃 conversation 作为领域概念名**，统一
-为 Session，仅在 `conversation history`（发给 provider 的 message 序列）这一技术
-含义上保留。
+TUI 与核心状态已统一使用 Session（`ActiveSession`、`SessionDraft`、`/new` 描述与未绑定分组标题 `"Session"`），仅在 `conversation history` / `ConversationStore`（底层 JSONL 消息流存储）这一技术含义上保留。
 
 ### 5.2 `conversation_outbox` 表是否改名
 

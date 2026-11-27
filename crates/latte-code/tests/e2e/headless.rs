@@ -475,3 +475,43 @@ pub(super) fn assert_tool_result_reached_provider(request: &Value) {
             })
     );
 }
+
+#[test]
+fn final_binary_cli_context_compact_and_flag_rejection_journeys() {
+    let cli_ws = Scenario::new();
+    for bad_args in [
+        &["list", "--auto"][..],
+        &["list", "--permission-mode", "ask"][..],
+        &["context"][..],
+        &["compact"][..],
+    ] {
+        assert!(!cli_ws.output(bad_args, |_| {}).status.success());
+    }
+    let provider =
+        super::support::ScriptedProvider::start([super::support::ProviderReply::completion(
+            "cli-human-ok",
+        )]);
+    std::fs::create_dir_all(cli_ws.home().join(".latte")).unwrap();
+    let ep = provider.endpoint();
+    std::fs::write(
+        cli_ws.home().join(".latte/latte-code.jsonc"),
+        format!(
+            r#"{{version:1,default_model:"p/m",providers:{{p:{{type:"openai-chat",models:["m"],endpoint:{ep:?},api_key:"k"}}}},session:{{compaction:{{enabled:false}}}}}}"#
+        ),
+    )
+    .unwrap();
+    let run_out = cli_ws.output(&["--json", "run", "hello"], |_| {});
+    assert!(run_out.status.success());
+    let run_sid = super::support::json(&run_out)["data"]["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ctx_out = cli_ws.output(&["context", &run_sid], |_| {});
+    assert!(ctx_out.status.success());
+    let cmp_out = cli_ws.output(&["compact", &run_sid], |_| {});
+    assert!(cmp_out.status.success());
+    assert!(
+        String::from_utf8_lossy(&cmp_out.stdout)
+            .contains("compaction is disabled in the resolved profile")
+    );
+}

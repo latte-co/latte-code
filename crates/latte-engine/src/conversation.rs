@@ -2,15 +2,23 @@
 use latte_core::{SessionId, TranscriptEntry, TranscriptEntryId, TranscriptKind, TurnId};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Mutex,
 };
 
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
+const MAX_BUCKET_SCAN_ENTRIES: usize = 10_000;
+
+#[derive(Clone, Debug)]
+pub(crate) struct ConversationDocument {
+    pub session_id: SessionId,
+    pub created_at_ms: u64,
+    pub entries: Vec<TranscriptEntry>,
+}
 
 #[derive(Debug)]
 pub(crate) struct ConversationStore {
@@ -38,12 +46,17 @@ impl ConversationStore {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn workspace_dir_for_test(&self) -> &Path {
+        &self.workspace_dir
+    }
+
     pub(crate) fn sync(
         &self,
         session_id: SessionId,
         created_at_ms: u64,
         entries: &[TranscriptEntry],
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         let _guard = self.io.lock().expect("conversation mutex poisoned");
         let path = self.workspace_dir.join(format!("{session_id}.jsonl"));
         let mut file = open_session_file(&path)?;
@@ -68,7 +81,8 @@ impl ConversationStore {
             write_record(&mut file, &header)?;
             file.sync_data().map_err(io_error)?;
         }
-        let (existing, _) = repair_and_read(&mut file, session_id, &self.workspace_key)?;
+        let parsed = repair_and_read(&mut file, session_id, &self.workspace_key)?;
+        let existing = parsed.existing;
         let mut last_sequence = existing.keys().next_back().copied().unwrap_or(0);
         file.seek(SeekFrom::End(0)).map_err(io_error)?;
         for entry in entries {
@@ -102,7 +116,8 @@ impl ConversationStore {
             write_record(&mut file, &record)?;
             last_sequence = entry.sequence;
         }
-        file.sync_data().map_err(io_error)
+        file.sync_data().map_err(io_error)?;
+        Ok(last_sequence)
     }
 
     pub(crate) fn read(&self, session_id: SessionId) -> Result<Vec<TranscriptEntry>, String> {
@@ -110,8 +125,123 @@ impl ConversationStore {
         let path = self.workspace_dir.join(format!("{session_id}.jsonl"));
         let mut file = open_session_file(&path)?;
         file.lock().map_err(io_error)?;
-        let (_, entries) = repair_and_read(&mut file, session_id, &self.workspace_key)?;
-        Ok(entries)
+        let parsed = repair_and_read(&mut file, session_id, &self.workspace_key)?;
+        Ok(parsed.entries)
+    }
+
+    pub(crate) fn read_existing(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<ConversationDocument>, String> {
+        let _guard = self.io.lock().expect("conversation mutex poisoned");
+        let path = self.workspace_dir.join(format!("{session_id}.jsonl"));
+        let Some(mut file) = open_existing_regular_file(&path)? else {
+            return Ok(None);
+        };
+        file.lock().map_err(io_error)?;
+        let parsed = repair_and_read(&mut file, session_id, &self.workspace_key)?;
+        Ok(Some(ConversationDocument {
+            session_id,
+            created_at_ms: parsed.created_at_ms,
+            entries: parsed.entries,
+        }))
+    }
+
+    pub(crate) fn inspect_for_materializing(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<ConversationDocument>, String> {
+        let _guard = self.io.lock().expect("conversation mutex poisoned");
+        let path = self.workspace_dir.join(format!("{session_id}.jsonl"));
+        let Some(mut file) = open_existing_regular_file_for_scan(&path)? else {
+            return Ok(None);
+        };
+        file.lock().map_err(io_error)?;
+        let Ok(parsed) = repair_and_read(&mut file, session_id, &self.workspace_key) else {
+            return Ok(None);
+        };
+        if parsed.entries.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(ConversationDocument {
+            session_id,
+            created_at_ms: parsed.created_at_ms,
+            entries: parsed.entries,
+        }))
+    }
+
+    pub(crate) fn scan_orphans(
+        &self,
+        known_sessions: &BTreeSet<SessionId>,
+    ) -> Result<Vec<ConversationDocument>, String> {
+        self.scan_orphans_with_cap(known_sessions, MAX_BUCKET_SCAN_ENTRIES)
+    }
+
+    fn scan_orphans_with_cap(
+        &self,
+        known_sessions: &BTreeSet<SessionId>,
+        max_entries: usize,
+    ) -> Result<Vec<ConversationDocument>, String> {
+        let _guard = self.io.lock().expect("conversation mutex poisoned");
+        ensure_private_directory(&self.workspace_dir)?;
+        let max_raw_entries = max_entries.saturating_mul(64).max(250_000);
+        let mut candidates = Vec::new();
+        let mut raw_scanned = 0usize;
+        for dir_entry in fs::read_dir(&self.workspace_dir).map_err(io_error)? {
+            raw_scanned = raw_scanned.saturating_add(1);
+            if raw_scanned > max_raw_entries {
+                return Err("conversation workspace directory exceeds bounded scan limit".into());
+            }
+            let dir_entry = dir_entry.map_err(io_error)?;
+            let file_name = dir_entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(stem) = name.strip_suffix(".jsonl") else {
+                continue;
+            };
+            let file_type = dir_entry.file_type().map_err(io_error)?;
+            if file_type.is_symlink() {
+                return Err(format!(
+                    "conversation file is a symlink: {}",
+                    dir_entry.path().display()
+                ));
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let Ok(uuid) = uuid::Uuid::parse_str(stem) else {
+                continue;
+            };
+            let session_id = SessionId::from_uuid(uuid);
+            if known_sessions.contains(&session_id) {
+                continue;
+            }
+            if candidates.len() >= max_entries {
+                return Err("conversation workspace directory exceeds bounded scan limit".into());
+            }
+            candidates.push((session_id, dir_entry.path()));
+        }
+        candidates.sort_by_key(|(session_id, _)| *session_id);
+        let mut recovered = Vec::new();
+        for (session_id, path) in candidates {
+            let Some(mut file) = open_existing_regular_file_for_scan(&path)? else {
+                continue;
+            };
+            file.lock().map_err(io_error)?;
+            let Ok(parsed) = repair_and_read(&mut file, session_id, &self.workspace_key) else {
+                continue;
+            };
+            if parsed.entries.is_empty() {
+                continue;
+            }
+            recovered.push(ConversationDocument {
+                session_id,
+                created_at_ms: parsed.created_at_ms,
+                entries: parsed.entries,
+            });
+        }
+        Ok(recovered)
     }
 }
 
@@ -164,12 +294,77 @@ fn open_session_file(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 
+fn open_existing_regular_file(path: &Path) -> Result<Option<File>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(error)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "conversation file is a symlink: {}",
+            path.display()
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "conversation path is not a regular file: {}",
+            path.display()
+        ));
+    }
+    if metadata.len() == 0 {
+        return Ok(None);
+    }
+    open_existing_writable(path).map(Some)
+}
+
+fn open_existing_regular_file_for_scan(path: &Path) -> Result<Option<File>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(error)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "conversation file is a symlink: {}",
+            path.display()
+        ));
+    }
+    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > MAX_FILE_BYTES {
+        return Ok(None);
+    }
+    open_existing_writable(path).map(Some)
+}
+
+fn open_existing_writable(path: &Path) -> Result<File, String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .truncate(false)
+        .open(path)
+        .map_err(io_error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(io_error)?;
+    }
+    Ok(file)
+}
+
+struct ParsedConversation {
+    created_at_ms: u64,
+    existing: BTreeMap<u64, String>,
+    entries: Vec<TranscriptEntry>,
+}
+
 #[allow(clippy::too_many_lines)]
 fn repair_and_read(
     file: &mut File,
     session_id: SessionId,
     workspace_key: &str,
-) -> Result<(BTreeMap<u64, String>, Vec<TranscriptEntry>), String> {
+) -> Result<ParsedConversation, String> {
     let length = file.metadata().map_err(io_error)?.len();
     if length > MAX_FILE_BYTES {
         return Err("conversation file exceeds the bounded repair limit".into());
@@ -203,6 +398,10 @@ fn repair_and_read(
     {
         return Err("conversation header identity mismatch".into());
     }
+    let created_at_ms = header
+        .get("created_at_ms")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "conversation header has no creation time".to_owned())?;
     let mut entries = BTreeMap::new();
     let mut transcript = Vec::new();
     let mut previous = 0;
@@ -281,7 +480,11 @@ fn repair_and_read(
                 .ok_or_else(|| "conversation record has no creation time".to_owned())?,
         });
     }
-    Ok((entries, transcript))
+    Ok(ParsedConversation {
+        created_at_ms,
+        existing: entries,
+        entries: transcript,
+    })
 }
 
 fn write_record(file: &mut File, record: &Value) -> Result<(), String> {
@@ -593,5 +796,144 @@ mod tests {
         fs::write(&path, b"{\"record\":\"header\"").unwrap();
         // read should fail because the header cannot be parsed.
         assert!(store.read(session_id).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn read_existing_inspect_and_scan_orphans_preserve_safety_and_bounds() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_key = "workspace-orphans";
+        let store = ConversationStore::open(root.path(), workspace_key).unwrap();
+        let ids = SystemIdSource::default();
+
+        let absent = SessionId::from_uuid(ids.next_uuid_v7());
+        assert!(store.read_existing(absent).unwrap().is_none());
+        assert!(!session_path(root.path(), workspace_key, absent).exists());
+        assert!(store.inspect_for_materializing(absent).unwrap().is_none());
+
+        let zero_byte = SessionId::from_uuid(ids.next_uuid_v7());
+        File::create(session_path(root.path(), workspace_key, zero_byte)).unwrap();
+        assert!(store.read_existing(zero_byte).unwrap().is_none());
+        assert!(
+            store
+                .inspect_for_materializing(zero_byte)
+                .unwrap()
+                .is_none()
+        );
+
+        let dir_disguised = SessionId::from_uuid(ids.next_uuid_v7());
+        fs::create_dir(session_path(root.path(), workspace_key, dir_disguised)).unwrap();
+        assert!(store.read_existing(dir_disguised).is_err());
+        assert!(
+            store
+                .inspect_for_materializing(dir_disguised)
+                .unwrap()
+                .is_none()
+        );
+
+        let header_only = SessionId::from_uuid(ids.next_uuid_v7());
+        overwrite_records(
+            &session_path(root.path(), workspace_key, header_only),
+            &header(header_only, workspace_key),
+            &[],
+        );
+        assert!(
+            store
+                .inspect_for_materializing(header_only)
+                .unwrap()
+                .is_none()
+        );
+
+        let missing_created = SessionId::from_uuid(ids.next_uuid_v7());
+        let mut bad_header = header(missing_created, workspace_key);
+        bad_header.as_object_mut().unwrap().remove("created_at_ms");
+        overwrite_records(
+            &session_path(root.path(), workspace_key, missing_created),
+            &bad_header,
+            &[record(&entry(1, "bad"))],
+        );
+        assert!(store.read_existing(missing_created).is_err());
+        assert!(
+            store
+                .inspect_for_materializing(missing_created)
+                .unwrap()
+                .is_none()
+        );
+
+        let known = SessionId::from_uuid(ids.next_uuid_v7());
+        assert_eq!(store.sync(known, 10, &[entry(1, "known")]).unwrap(), 1);
+
+        let orphan = SessionId::from_uuid(ids.next_uuid_v7());
+        assert_eq!(
+            store
+                .sync(orphan, 42, &[entry(1, "orphan-1"), entry(2, "orphan-2")])
+                .unwrap(),
+            2
+        );
+        // Append a torn final line to prove scan_orphans repairs it cleanly.
+        OpenOptions::new()
+            .append(true)
+            .open(session_path(root.path(), workspace_key, orphan))
+            .unwrap()
+            .write_all(br#"{"record":"entry","seq":3"#)
+            .unwrap();
+
+        // Noise entries that scan_orphans must safely skip.
+        fs::write(root.path().join(workspace_key).join("notes.txt"), "ignore").unwrap();
+        fs::write(
+            root.path().join(workspace_key).join("not-a-uuid.jsonl"),
+            "ignore",
+        )
+        .unwrap();
+
+        let inspected = store.inspect_for_materializing(orphan).unwrap().unwrap();
+        assert_eq!(inspected.created_at_ms, 42);
+        assert_eq!(inspected.entries.len(), 2);
+
+        let existing_doc = store.read_existing(orphan).unwrap().unwrap();
+        assert_eq!(existing_doc.session_id, orphan);
+        assert_eq!(existing_doc.created_at_ms, 42);
+        assert_eq!(existing_doc.entries.len(), 2);
+
+        let orphans = store.scan_orphans(&BTreeSet::from([known])).unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].session_id, orphan);
+        assert_eq!(orphans[0].created_at_ms, 42);
+        assert_eq!(orphans[0].entries.len(), 2);
+
+        assert!(
+            store
+                .scan_orphans_with_cap(&BTreeSet::new(), 1)
+                .unwrap_err()
+                .contains("exceeds bounded scan limit")
+        );
+        // Registered sessions do NOT consume the orphan cap (#15): there are 4 unregistered
+        // `.jsonl` files (`zero_byte`, `header_only`, `missing_created`, `orphan`) plus 6
+        // registered sessions (`10` `.jsonl` files total), so `cap = 4` succeeds!
+        let mut many_known = BTreeSet::from([known]);
+        for seq in 0..5 {
+            let sid = SessionId::from_uuid(ids.next_uuid_v7());
+            store
+                .sync(sid, 100 + seq, &[entry(1, "registered")])
+                .unwrap();
+            many_known.insert(sid);
+        }
+        let bounded_orphans = store.scan_orphans_with_cap(&many_known, 4).unwrap();
+        assert_eq!(bounded_orphans.len(), 1);
+        assert_eq!(bounded_orphans[0].session_id, orphan);
+
+        #[cfg(unix)]
+        {
+            let linked = SessionId::from_uuid(ids.next_uuid_v7());
+            let link_path = session_path(root.path(), workspace_key, linked);
+            std::os::unix::fs::symlink(
+                session_path(root.path(), workspace_key, orphan),
+                &link_path,
+            )
+            .unwrap();
+            assert!(store.read_existing(linked).is_err());
+            assert!(store.inspect_for_materializing(linked).is_err());
+            assert!(store.scan_orphans(&BTreeSet::new()).is_err());
+        }
     }
 }

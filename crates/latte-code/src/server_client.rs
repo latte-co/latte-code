@@ -39,10 +39,12 @@ pub enum ClientError {
     Unauthorized(String),
     /// A revision fence conflict. Exit 1.
     Conflict(String),
+    /// An `Idempotency-Key` / `command_id` was reused with a different payload. Exit 1.
+    IdempotencyMismatch(String),
     /// An internal server or infrastructure failure. Exit 70.
     Internal(String),
-    /// Any other failure. Exit 1.
-    Failed(String),
+    /// Any other unclassified client/protocol failure. Exit 1.
+    Unclassified(String),
 }
 
 impl ClientError {
@@ -53,7 +55,7 @@ impl ClientError {
             Self::Usage(_) => 2,
             Self::NotFound(_) => 4,
             Self::Unauthorized(_) | Self::Internal(_) => 70,
-            Self::Conflict(_) | Self::Failed(_) => 1,
+            Self::Conflict(_) | Self::IdempotencyMismatch(_) | Self::Unclassified(_) => 1,
         }
     }
 
@@ -66,7 +68,8 @@ impl ClientError {
             Self::Unauthorized(_) => "unauthorized",
             Self::Internal(_) => "internal",
             Self::Conflict(_) => "conflict",
-            Self::Failed(_) => "failed",
+            Self::IdempotencyMismatch(_) => "idempotency_mismatch",
+            Self::Unclassified(_) => "unclassified",
         }
     }
 
@@ -79,7 +82,8 @@ impl ClientError {
             | Self::Unauthorized(message)
             | Self::Internal(message)
             | Self::Conflict(message)
-            | Self::Failed(message) => message,
+            | Self::IdempotencyMismatch(message)
+            | Self::Unclassified(message) => message,
         }
     }
 }
@@ -97,17 +101,29 @@ fn network(error: reqwest::Error) -> ClientError {
     if error.is_connect() || error.is_timeout() {
         ClientError::Unreachable(error.to_string())
     } else {
-        ClientError::Failed(error.to_string())
+        ClientError::Unclassified(error.to_string())
     }
 }
 
 fn map_error_status(status: reqwest::StatusCode, body: &Value) -> ClientError {
-    let message = body
-        .get("error")
+    let error = body.get("error");
+    let message = error
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
         .unwrap_or("server error")
         .to_string();
+    match error
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("unauthorized") => return ClientError::Unauthorized(message),
+        Some("not_found") => return ClientError::NotFound(message),
+        Some("rejected") => return ClientError::Usage(message),
+        Some("conflict") => return ClientError::Conflict(message),
+        Some("idempotency_mismatch") => return ClientError::IdempotencyMismatch(message),
+        Some("failed") => return ClientError::Internal(format!("{status}: {message}")),
+        _ => {}
+    }
     if status == reqwest::StatusCode::UNAUTHORIZED {
         ClientError::Unauthorized(message)
     } else if status == reqwest::StatusCode::NOT_FOUND {
@@ -116,10 +132,12 @@ fn map_error_status(status: reqwest::StatusCode, body: &Value) -> ClientError {
         ClientError::Usage(message)
     } else if status == reqwest::StatusCode::CONFLICT {
         ClientError::Conflict(message)
+    } else if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+        ClientError::IdempotencyMismatch(message)
     } else if status.is_server_error() {
         ClientError::Internal(format!("{status}: {message}"))
     } else {
-        ClientError::Failed(format!("{status}: {message}"))
+        ClientError::Unclassified(format!("{status}: {message}"))
     }
 }
 
@@ -154,15 +172,17 @@ pub struct ParsedSessionCommand {
     pub json: bool,
     pub server: Option<String>,
     pub token: Option<String>,
+    pub permission_mode: Option<latte_core::PermissionMode>,
 }
 
 /// Parses `run`/`list`/`show`/`resume` plus the shared `--json`/`--server`/
 /// `--token` flags (accepted in any position). `--focus` is only valid on
-/// `run`.
+/// `run`; `--auto` and `--permission-mode` are valid on `run` and `resume`.
 ///
 /// # Errors
 /// Returns a usage message for unknown commands/options, missing values, wrong
 /// arity, or malformed session ids.
+#[allow(clippy::too_many_lines)]
 pub fn parse_session_command(args: &[String]) -> Result<ParsedSessionCommand, String> {
     let (name, rest) = args.split_first().ok_or_else(|| {
         "expected a command: run | list | show | context | compact | resume".to_string()
@@ -171,6 +191,7 @@ pub fn parse_session_command(args: &[String]) -> Result<ParsedSessionCommand, St
     let mut server = None;
     let mut token = None;
     let mut focus = None;
+    let mut permission_mode = None;
     let mut positional = Vec::new();
     let mut iter = rest.iter();
     while let Some(arg) = iter.next() {
@@ -188,6 +209,22 @@ pub fn parse_session_command(args: &[String]) -> Result<ParsedSessionCommand, St
                 focus = Some(PathBuf::from(next_value(&mut iter, "--focus")?));
             }
             "--focus" => return Err("--focus is only valid with run".to_string()),
+            "--auto" if name == "run" || name == "resume" => {
+                permission_mode = Some(latte_core::PermissionMode::FullAuto);
+            }
+            "--auto" => return Err("--auto is only valid with run or resume".to_string()),
+            "--permission-mode" if name == "run" || name == "resume" => {
+                let raw = next_value(&mut iter, "--permission-mode")?;
+                let mode = latte_core::PermissionMode::parse_mode(&raw).map_err(|_| {
+                    format!(
+                        "invalid --permission-mode `{raw}`: expected ask, auto-edit, or full-auto"
+                    )
+                })?;
+                permission_mode = Some(mode);
+            }
+            "--permission-mode" => {
+                return Err("--permission-mode is only valid with run or resume".to_string());
+            }
             // Removed v1 flags that must remain hard errors.
             flag @ ("--allow" | "--deny") => {
                 return Err(format!(
@@ -262,6 +299,7 @@ pub fn parse_session_command(args: &[String]) -> Result<ParsedSessionCommand, St
         json,
         server,
         token,
+        permission_mode,
     })
 }
 
@@ -288,7 +326,20 @@ pub fn parse_session_id(value: &str) -> Result<SessionId, ClientError> {
 // Terminal classification (pure, mirrors design doc §6.4)
 // ---------------------------------------------------------------------------
 
-/// The terminal outcome of a session, derived from lifecycle + latest turn.
+/// CLI process outcome synthesized from the durable session projection.
+///
+/// Latte Code separates three orthogonal status dimensions:
+/// 1. **Session continuability** (`SessionSnapshot.lifecycle` / [`SessionLifecycle`]):
+///    whether the session can accept a follow-up turn (`ready` means continuable,
+///    not "the last turn succeeded").
+/// 2. **Latest turn outcome** (`SessionTurnSummary.{status, failure_code}`):
+///    whether the most recent turn completed, failed retryably, or ended with
+///    permission denial / cancellation.
+/// 3. **CLI invocation outcome** (`TerminalOutcome`, emitted as top-level
+///    `status` and mapped to process exit code): synthesizes dimensions 1 + 2 so
+///    `{"status": "denied", "data": {"session": {"lifecycle": "ready"}}}` reports
+///    both that this invocation was denied (exit `11`) and that the session
+///    remains continuable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalOutcome {
     Completed,
@@ -324,8 +375,9 @@ impl TerminalOutcome {
     }
 }
 
-/// Classifies a snapshot per the §6.4 exit-code table. Returns `None` while the
-/// session is still running.
+/// Synthesizes [`TerminalOutcome`] from `snapshot.lifecycle` + the latest
+/// [`latte_core::SessionTurnSummary`] per the §6.4 exit-code table. Returns
+/// `None` while the session still has an active running turn.
 #[must_use]
 pub fn classify(snapshot: &SessionSnapshot) -> Option<TerminalOutcome> {
     match snapshot.lifecycle {
@@ -352,9 +404,9 @@ pub fn classify(snapshot: &SessionSnapshot) -> Option<TerminalOutcome> {
     }
 }
 
-/// The newest child turn by ordinal.
+/// The newest child turn by `turn_ordinal`.
 fn latest_turn(snapshot: &SessionSnapshot) -> Option<&latte_core::SessionTurnSummary> {
-    snapshot.turns.iter().max_by_key(|turn| turn.ordinal)
+    snapshot.turns.iter().max_by_key(|turn| turn.turn_ordinal)
 }
 
 /// The result of observing a session to completion.
@@ -406,7 +458,10 @@ impl TurnResult {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
     /// Durable session state changed; refetch the snapshot.
-    SessionChanged { session_id: String, revision: u64 },
+    SessionChanged {
+        session_id: String,
+        session_revision: u64,
+    },
     /// Transient provider progress.
     Progress {
         session_id: String,
@@ -424,7 +479,10 @@ pub fn parse_sse_frame(event_type: Option<&str>, data: &str) -> Option<StreamEve
     match event_type {
         Some("session_changed") => Some(StreamEvent::SessionChanged {
             session_id: value.get("session_id")?.as_str()?.to_string(),
-            revision: value.get("revision")?.as_u64()?,
+            session_revision: value
+                .get("session_revision")
+                .or_else(|| value.get("revision"))?
+                .as_u64()?,
         }),
         Some("progress") => Some(StreamEvent::Progress {
             session_id: value.get("session_id")?.as_str()?.to_string(),
@@ -508,7 +566,7 @@ pub fn render_session_text(snapshot: &SessionSnapshot) -> String {
     );
     let mut out = format!(
         "session {}: {} (revision {})",
-        snapshot.session_id, status, snapshot.revision
+        snapshot.session_id, status, snapshot.session_revision
     );
     if let Some(text) = last_message_text(snapshot) {
         out.push('\n');
@@ -524,7 +582,7 @@ pub fn render_session_row(snapshot: &SessionSnapshot) -> String {
         "{}\t{}\trev {}",
         snapshot.session_id,
         lifecycle_name(snapshot.lifecycle),
-        snapshot.revision
+        snapshot.session_revision
     )
 }
 
@@ -636,14 +694,17 @@ pub fn render_compact(result: &latte_core::ManualCompactionResult) -> String {
         ManualCompactionIdleReason as Reason, ManualCompactionState, ManualCompactionTier as Tier,
     };
     match result.state {
-        ManualCompactionState::Compacted { tier, revision } => {
+        ManualCompactionState::Compacted {
+            tier,
+            session_revision,
+        } => {
             let how = match tier {
                 Tier::Elided => {
                     "elided older tool results into deterministic skeletons (no model request)"
                 }
                 Tier::Summarized => "summarized older history",
             };
-            format!("compacted history ({how}); session revision {revision}")
+            format!("compacted history ({how}); session revision {session_revision}")
         }
         ManualCompactionState::NothingToCompact { reason } => {
             let why = match reason {
@@ -691,6 +752,22 @@ pub trait SessionServer {
         focus: Option<&Path>,
         binding: &Value,
     ) -> Result<u64, ClientError>;
+    /// Creates a session with an optional initial permission mode.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_session_with_mode(
+        &mut self,
+        workspace_id: &str,
+        session_id: SessionId,
+        command_id: SessionCommandId,
+        prompt: &str,
+        focus: Option<&Path>,
+        binding: &Value,
+        permission_mode: Option<latte_core::PermissionMode>,
+    ) -> Result<u64, ClientError> {
+        let _ = permission_mode;
+        self.create_session(workspace_id, session_id, command_id, prompt, focus, binding)
+            .await
+    }
     /// Appends a follow-up turn. Returns the accepted revision and the
     /// workspace id that owns the session (so the caller can subscribe to
     /// the correct event stream when the cwd workspace differs). The
@@ -703,6 +780,19 @@ pub trait SessionServer {
         expected_revision: u64,
         prompt: &str,
     ) -> Result<(u64, String), ClientError>;
+    /// Appends a follow-up turn with an optional permission mode override.
+    async fn follow_up_with_mode(
+        &mut self,
+        session_id: &SessionId,
+        command_id: &SessionCommandId,
+        expected_revision: u64,
+        prompt: &str,
+        permission_mode: Option<latte_core::PermissionMode>,
+    ) -> Result<(u64, String), ClientError> {
+        let _ = permission_mode;
+        self.follow_up(session_id, command_id, expected_revision, prompt)
+            .await
+    }
     /// Fetches the authoritative session snapshot.
     async fn snapshot(&mut self, session_id: &SessionId) -> Result<SessionSnapshot, ClientError>;
     /// Fetches the read-only context-usage projection for one session.
@@ -737,11 +827,26 @@ pub trait SessionServer {
 
 /// Creates a session and observes it to a terminal state, streaming progress
 /// through `on_progress`. `cancel` resolves on local Ctrl+C.
+#[cfg(test)]
 pub async fn run_session(
     server: &mut impl SessionServer,
     root: &Path,
     prompt: &str,
     focus: Option<&Path>,
+    on_progress: &mut impl FnMut(&str),
+    cancel: impl std::future::Future<Output = ()>,
+) -> Result<TurnResult, ClientError> {
+    run_session_with_mode(server, root, prompt, focus, None, on_progress, cancel).await
+}
+
+/// Creates a session with an optional permission mode and observes it to a
+/// terminal state.
+pub async fn run_session_with_mode(
+    server: &mut impl SessionServer,
+    root: &Path,
+    prompt: &str,
+    focus: Option<&Path>,
+    permission_mode: Option<latte_core::PermissionMode>,
     on_progress: &mut impl FnMut(&str),
     cancel: impl std::future::Future<Output = ()>,
 ) -> Result<TurnResult, ClientError> {
@@ -757,13 +862,14 @@ pub async fn run_session(
     let session_id = SessionId::from_uuid(Uuid::now_v7());
     let command_id = SessionCommandId::from_uuid(Uuid::now_v7());
     tokio::select! {
-        result = server.create_session(
+        result = server.create_session_with_mode(
             &workspace_id,
             session_id,
             command_id,
             prompt,
             focus,
             &binding,
+            permission_mode,
         ) => result?,
         () = &mut cancel => {
             // The session may have been created server-side even though the
@@ -776,11 +882,26 @@ pub async fn run_session(
 }
 
 /// Appends a follow-up turn and observes the session to a terminal state.
+#[cfg(test)]
 pub async fn resume_session(
     server: &mut impl SessionServer,
     root: &Path,
     session_id: &str,
     prompt: &str,
+    on_progress: &mut impl FnMut(&str),
+    cancel: impl std::future::Future<Output = ()>,
+) -> Result<TurnResult, ClientError> {
+    resume_session_with_mode(server, root, session_id, prompt, None, on_progress, cancel).await
+}
+
+/// Appends a follow-up turn with an optional permission mode override and
+/// observes the session to a terminal state.
+pub async fn resume_session_with_mode(
+    server: &mut impl SessionServer,
+    root: &Path,
+    session_id: &str,
+    prompt: &str,
+    permission_mode: Option<latte_core::PermissionMode>,
     on_progress: &mut impl FnMut(&str),
     cancel: impl std::future::Future<Output = ()>,
 ) -> Result<TurnResult, ClientError> {
@@ -799,7 +920,13 @@ pub async fn resume_session(
     // instead of appending a duplicate turn.
     let command_id = SessionCommandId::from_uuid(Uuid::now_v7());
     let (_, event_workspace_id) = tokio::select! {
-        result = server.follow_up(&session_id, &command_id, snapshot.revision, prompt) => result?,
+        result = server.follow_up_with_mode(
+            &session_id,
+            &command_id,
+            snapshot.session_revision,
+            prompt,
+            permission_mode,
+        ) => result?,
         () = &mut cancel => return Ok(cancel_session(server, &session_id).await),
     };
     observe_session(
@@ -923,7 +1050,7 @@ async fn cancel_session(server: &mut impl SessionServer, session_id: &SessionId)
     if let Some(snapshot) = &snapshot {
         let turn_revision = latest_turn(snapshot).map_or(0, |turn| turn.turn_revision);
         let _ = server
-            .cancel(session_id, snapshot.revision, turn_revision)
+            .cancel(session_id, snapshot.session_revision, turn_revision)
             .await;
     }
     TurnResult::Cancelled { snapshot }
@@ -1083,8 +1210,9 @@ impl EventStream {
             };
             let line_bytes: Vec<u8> = self.buf[..newline].to_vec();
             self.buf.drain(..=newline);
-            let line = String::from_utf8(line_bytes)
-                .map_err(|error| ClientError::Failed(format!("invalid UTF-8 in SSE: {error}")))?;
+            let line = String::from_utf8(line_bytes).map_err(|error| {
+                ClientError::Unclassified(format!("invalid UTF-8 in SSE: {error}"))
+            })?;
             if let Some(event) = self.decoder.line(line.trim_end_matches('\r')) {
                 return Ok(Some(event));
             }
@@ -1152,16 +1280,15 @@ impl ServerHandle {
 
     async fn json(response: reqwest::Response) -> Result<Value, ClientError> {
         let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| ClientError::Failed(format!("cannot read response body: {error}")))?;
+        let bytes = response.bytes().await.map_err(|error| {
+            ClientError::Unclassified(format!("cannot read response body: {error}"))
+        })?;
         if status.is_success() {
             if bytes.is_empty() {
                 return Ok(Value::Null);
             }
             return serde_json::from_slice(&bytes).map_err(|error| {
-                ClientError::Failed(format!("invalid JSON from server: {error}"))
+                ClientError::Unclassified(format!("invalid JSON from server: {error}"))
             });
         }
         let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
@@ -1179,7 +1306,9 @@ impl ServerHandle {
             .get("workspace_id")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .ok_or_else(|| ClientError::Failed("workspace response missing workspace_id".into()))
+            .ok_or_else(|| {
+                ClientError::Unclassified("workspace response missing workspace_id".into())
+            })
     }
 
     /// Maximum number of cursor pages a single list call will fetch. The
@@ -1213,15 +1342,16 @@ impl ServerHandle {
             let value = self.get(&path).await?;
             let sessions = value.get("sessions").cloned().unwrap_or_else(|| json!([]));
             all.extend(
-                serde_json::from_value::<Vec<T>>(sessions)
-                    .map_err(|error| ClientError::Failed(format!("invalid {what}: {error}")))?,
+                serde_json::from_value::<Vec<T>>(sessions).map_err(|error| {
+                    ClientError::Unclassified(format!("invalid {what}: {error}"))
+                })?,
             );
             match value.get("next_cursor").and_then(Value::as_str) {
                 None => return Ok(all),
                 Some(next) => cursor = Some(next.to_owned()),
             }
         }
-        Err(ClientError::Failed(format!(
+        Err(ClientError::Unclassified(format!(
             "session listing exceeded {} pages",
             Self::MAX_SESSION_PAGES
         )))
@@ -1243,12 +1373,11 @@ impl ServerHandle {
     /// Fetches the authoritative snapshot for one session.
     pub async fn snapshot(&self, session_id: &SessionId) -> Result<SessionSnapshot, ClientError> {
         let value = self.get(&format!("/v1/sessions/{session_id}")).await?;
-        let snapshot = value
-            .get("snapshot")
-            .cloned()
-            .ok_or_else(|| ClientError::Failed("snapshot response missing snapshot".into()))?;
+        let snapshot = value.get("snapshot").cloned().ok_or_else(|| {
+            ClientError::Unclassified("snapshot response missing snapshot".into())
+        })?;
         serde_json::from_value(snapshot)
-            .map_err(|error| ClientError::Failed(format!("invalid snapshot: {error}")))
+            .map_err(|error| ClientError::Unclassified(format!("invalid snapshot: {error}")))
     }
 
     /// Fetches a session snapshot, returning `None` if the session does not exist.
@@ -1273,9 +1402,9 @@ impl ServerHandle {
         let usage = value
             .get("usage")
             .cloned()
-            .ok_or_else(|| ClientError::Failed("context response missing usage".into()))?;
+            .ok_or_else(|| ClientError::Unclassified("context response missing usage".into()))?;
         serde_json::from_value(usage)
-            .map_err(|error| ClientError::Failed(format!("invalid context usage: {error}")))
+            .map_err(|error| ClientError::Unclassified(format!("invalid context usage: {error}")))
     }
 
     /// Drives the idle-only manual compact operation. The endpoint is
@@ -1295,34 +1424,42 @@ impl ServerHandle {
         let snapshot = value
             .get("snapshot")
             .cloned()
-            .ok_or_else(|| ClientError::Failed("compact response missing snapshot".into()))?;
+            .ok_or_else(|| ClientError::Unclassified("compact response missing snapshot".into()))?;
         let state = value
             .get("state")
             .cloned()
-            .ok_or_else(|| ClientError::Failed("compact response missing state".into()))?;
+            .ok_or_else(|| ClientError::Unclassified("compact response missing state".into()))?;
         Ok(latte_core::ManualCompactionResult {
             snapshot: serde_json::from_value(snapshot)
-                .map_err(|error| ClientError::Failed(format!("invalid snapshot: {error}")))?,
-            state: serde_json::from_value(state)
-                .map_err(|error| ClientError::Failed(format!("invalid compact state: {error}")))?,
+                .map_err(|error| ClientError::Unclassified(format!("invalid snapshot: {error}")))?,
+            state: serde_json::from_value(state).map_err(|error| {
+                ClientError::Unclassified(format!("invalid compact state: {error}"))
+            })?,
         })
     }
 
-    /// Creates a session and starts its first turn.
-    pub async fn create_session(
+    /// Creates a session with an optional initial permission mode and starts
+    /// its first turn.
+    pub async fn create_session_with_mode(
         &self,
         workspace_id: &str,
         session_id: SessionId,
         command_id: SessionCommandId,
         prompt: &str,
         binding: &Value,
+        permission_mode: Option<latte_core::PermissionMode>,
     ) -> Result<u64, ClientError> {
-        let body = json!({
+        let mut body = json!({
             "session_id": session_id.to_string(),
             "command_id": command_id.to_string(),
             "prompt": prompt,
             "binding": binding,
         });
+        if let Some(mode) = permission_mode
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert("permission_mode".into(), json!(mode));
+        }
         let value = self
             .post(
                 &format!("/v1/workspaces/{workspace_id}/sessions"),
@@ -1333,7 +1470,24 @@ impl ServerHandle {
         value
             .get("accepted_revision")
             .and_then(Value::as_u64)
-            .ok_or_else(|| ClientError::Failed("create response missing accepted_revision".into()))
+            .ok_or_else(|| {
+                ClientError::Unclassified("create response missing accepted_revision".into())
+            })
+    }
+
+    /// Updates a session's in-memory permission mode on the server.
+    pub async fn set_permission_mode(
+        &self,
+        session_id: &SessionId,
+        permission_mode: latte_core::PermissionMode,
+    ) -> Result<(), ClientError> {
+        self.post(
+            &format!("/v1/sessions/{session_id}/permission-mode"),
+            json!({ "permission_mode": permission_mode }),
+            None,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Appends a follow-up turn to an existing session. The caller supplies a
@@ -1406,11 +1560,11 @@ impl ServerHandle {
             .await?;
         let snapshot = value
             .get("snapshot")
-            .ok_or_else(|| ClientError::Failed("fork response missing snapshot".into()))?;
+            .ok_or_else(|| ClientError::Unclassified("fork response missing snapshot".into()))?;
         let session_id = snapshot
             .get("session_id")
             .and_then(Value::as_str)
-            .ok_or_else(|| ClientError::Failed("fork snapshot missing session_id".into()))?;
+            .ok_or_else(|| ClientError::Unclassified("fork snapshot missing session_id".into()))?;
         parse_session_id(session_id)
     }
 
@@ -1446,7 +1600,7 @@ impl ServerHandle {
         value
             .get("position")
             .and_then(Value::as_u64)
-            .ok_or_else(|| ClientError::Failed("queue response missing position".into()))
+            .ok_or_else(|| ClientError::Unclassified("queue response missing position".into()))
     }
 
     /// Provides input for a waiting-input session.
@@ -1550,7 +1704,9 @@ impl ServerHandle {
         let bindings = value
             .get("bindings")
             .and_then(Value::as_array)
-            .ok_or_else(|| ClientError::Failed("bindings response missing bindings".into()))?;
+            .ok_or_else(|| {
+                ClientError::Unclassified("bindings response missing bindings".into())
+            })?;
         Ok(bindings.clone())
     }
 }
@@ -1654,7 +1810,9 @@ impl SessionServer for ServerClient {
         let id = value
             .get("workspace_id")
             .and_then(Value::as_str)
-            .ok_or_else(|| ClientError::Failed("workspace response missing workspace_id".into()))?
+            .ok_or_else(|| {
+                ClientError::Unclassified("workspace response missing workspace_id".into())
+            })?
             .to_string();
         self.workspace_id = Some(id.clone());
         Ok(id)
@@ -1667,7 +1825,9 @@ impl SessionServer for ServerClient {
         let bindings = value
             .get("bindings")
             .and_then(Value::as_array)
-            .ok_or_else(|| ClientError::Failed("bindings response missing bindings".into()))?;
+            .ok_or_else(|| {
+                ClientError::Unclassified("bindings response missing bindings".into())
+            })?;
         let selected = bindings
             .iter()
             .find(|entry| {
@@ -1686,7 +1846,7 @@ impl SessionServer for ServerClient {
         selected
             .get("binding")
             .cloned()
-            .ok_or_else(|| ClientError::Failed("binding entry missing binding".into()))
+            .ok_or_else(|| ClientError::Unclassified("binding entry missing binding".into()))
     }
 
     async fn create_session(
@@ -1698,13 +1858,41 @@ impl SessionServer for ServerClient {
         focus: Option<&Path>,
         binding: &Value,
     ) -> Result<u64, ClientError> {
-        let body = json!({
+        self.create_session_with_mode(
+            workspace_id,
+            session_id,
+            command_id,
+            prompt,
+            focus,
+            binding,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_session_with_mode(
+        &mut self,
+        workspace_id: &str,
+        session_id: SessionId,
+        command_id: SessionCommandId,
+        prompt: &str,
+        focus: Option<&Path>,
+        binding: &Value,
+        permission_mode: Option<latte_core::PermissionMode>,
+    ) -> Result<u64, ClientError> {
+        let mut body = json!({
             "session_id": session_id.to_string(),
             "command_id": command_id.to_string(),
             "prompt": prompt,
             "binding": binding,
             "focus": focus.map(|path| path.display().to_string()),
         });
+        if let Some(mode) = permission_mode
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert("permission_mode".into(), json!(mode));
+        }
         let value = self
             .post(
                 &format!("/v1/workspaces/{workspace_id}/sessions"),
@@ -1715,7 +1903,9 @@ impl SessionServer for ServerClient {
         value
             .get("accepted_revision")
             .and_then(Value::as_u64)
-            .ok_or_else(|| ClientError::Failed("create response missing accepted_revision".into()))
+            .ok_or_else(|| {
+                ClientError::Unclassified("create response missing accepted_revision".into())
+            })
     }
 
     async fn follow_up(
@@ -1725,11 +1915,28 @@ impl SessionServer for ServerClient {
         expected_revision: u64,
         prompt: &str,
     ) -> Result<(u64, String), ClientError> {
-        let body = json!({
+        self.follow_up_with_mode(session_id, command_id, expected_revision, prompt, None)
+            .await
+    }
+
+    async fn follow_up_with_mode(
+        &mut self,
+        session_id: &SessionId,
+        command_id: &SessionCommandId,
+        expected_revision: u64,
+        prompt: &str,
+        permission_mode: Option<latte_core::PermissionMode>,
+    ) -> Result<(u64, String), ClientError> {
+        let mut body = json!({
             "command_id": command_id.to_string(),
             "prompt": prompt,
             "expected_session_revision": expected_revision,
         });
+        if let Some(mode) = permission_mode
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert("permission_mode".into(), json!(mode));
+        }
         // Follow-up is a durable mutation: the stable command_id doubles as
         // the Idempotency-Key so a timeout/retry replays instead of
         // appending a duplicate turn.
@@ -1744,24 +1951,25 @@ impl SessionServer for ServerClient {
             .get("accepted_revision")
             .and_then(Value::as_u64)
             .ok_or_else(|| {
-                ClientError::Failed("follow-up response missing accepted_revision".into())
+                ClientError::Unclassified("follow-up response missing accepted_revision".into())
             })?;
         let workspace_id = value
             .get("workspace_id")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .ok_or_else(|| ClientError::Failed("follow-up response missing workspace_id".into()))?;
+            .ok_or_else(|| {
+                ClientError::Unclassified("follow-up response missing workspace_id".into())
+            })?;
         Ok((revision, workspace_id))
     }
 
     async fn snapshot(&mut self, session_id: &SessionId) -> Result<SessionSnapshot, ClientError> {
         let value = self.get(&format!("/v1/sessions/{session_id}")).await?;
-        let snapshot = value
-            .get("snapshot")
-            .cloned()
-            .ok_or_else(|| ClientError::Failed("snapshot response missing snapshot".into()))?;
+        let snapshot = value.get("snapshot").cloned().ok_or_else(|| {
+            ClientError::Unclassified("snapshot response missing snapshot".into())
+        })?;
         serde_json::from_value(snapshot)
-            .map_err(|error| ClientError::Failed(format!("invalid snapshot: {error}")))
+            .map_err(|error| ClientError::Unclassified(format!("invalid snapshot: {error}")))
     }
 
     async fn context_usage(&mut self, session_id: &SessionId) -> Result<ContextUsage, ClientError> {
@@ -1831,7 +2039,7 @@ impl SessionServer for ServerClient {
 
     async fn next_event(&mut self) -> Result<Option<StreamEvent>, ClientError> {
         let Some(events) = self.events.as_mut() else {
-            return Err(ClientError::Failed("event stream not open".into()));
+            return Err(ClientError::Unclassified("event stream not open".into()));
         };
         if events.done {
             return Ok(None);
@@ -1873,7 +2081,7 @@ mod tests {
 
     fn binding() -> SessionProviderBinding {
         SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "main".into(),
             provider_type: "openai-chat".into(),
             protocol: "openai-chat".into(),
@@ -1890,9 +2098,10 @@ mod tests {
     fn snapshot(lifecycle: SessionLifecycle, runs: Vec<SessionTurnSummary>) -> SessionSnapshot {
         SessionSnapshot {
             session_id: SessionId::from_uuid(Uuid::now_v7()),
-            revision: 1,
+            session_revision: 1,
             sequence: 0,
             lifecycle,
+            permission_mode: latte_core::PermissionMode::Ask,
             binding: binding(),
             latest_turn_id: runs.last().map(|run| run.turn_id),
             active_turn_id: None,
@@ -1914,7 +2123,7 @@ mod tests {
         SessionTurnSummary {
             turn_id: TurnId::from_uuid(Uuid::now_v7()),
             parent_turn_id: None,
-            ordinal: 1,
+            turn_ordinal: 1,
             status,
             turn_revision: 1,
             completed_at_ms: None,
@@ -2022,6 +2231,32 @@ mod tests {
             error.contains("--deny") && error.contains("permission API"),
             "unexpected error: {error}"
         );
+        // `--auto` and `--permission-mode` parse cleanly on `run` and `resume`
+        // and reject invalid modes or non-turn subcommands.
+        let auto_run = parse_session_command(&args(&["run", "--auto", "fix", "bug"])).unwrap();
+        assert_eq!(
+            auto_run.permission_mode,
+            Some(latte_core::PermissionMode::FullAuto)
+        );
+        let auto_edit = parse_session_command(&args(&[
+            "resume",
+            "01900000-0000-7000-8000-000000000001",
+            "--permission-mode",
+            "auto-edit",
+            "continue",
+        ]))
+        .unwrap();
+        assert_eq!(
+            auto_edit.permission_mode,
+            Some(latte_core::PermissionMode::AutoEdit)
+        );
+        assert!(parse_session_command(&args(&["list", "--auto"])).is_err());
+        assert!(
+            parse_session_command(&args(&["show", "--permission-mode", "ask", "foo"])).is_err()
+        );
+        assert!(
+            parse_session_command(&args(&["run", "--permission-mode", "bogus", "hi"])).is_err()
+        );
     }
 
     #[test]
@@ -2100,9 +2335,9 @@ mod tests {
         );
         // The newest run by ordinal wins.
         let mut older = turn_summary(SessionTurnStatus::Failed, None);
-        older.ordinal = 1;
+        older.turn_ordinal = 1;
         let mut newer = turn_summary(SessionTurnStatus::Completed, None);
-        newer.ordinal = 2;
+        newer.turn_ordinal = 2;
         assert_eq!(
             classify(&snapshot(SessionLifecycle::Ready, vec![older, newer])),
             Some(TerminalOutcome::Completed)
@@ -2134,11 +2369,21 @@ mod tests {
         assert_eq!(
             parse_sse_frame(
                 Some("session_changed"),
+                r#"{"session_id":"01900000-0000-7000-8000-000000000001","session_revision":7}"#
+            ),
+            Some(StreamEvent::SessionChanged {
+                session_id: "01900000-0000-7000-8000-000000000001".into(),
+                session_revision: 7
+            })
+        );
+        assert_eq!(
+            parse_sse_frame(
+                Some("session_changed"),
                 r#"{"session_id":"01900000-0000-7000-8000-000000000001","revision":7}"#
             ),
             Some(StreamEvent::SessionChanged {
                 session_id: "01900000-0000-7000-8000-000000000001".into(),
-                revision: 7
+                session_revision: 7
             })
         );
         let progress = parse_sse_frame(
@@ -2175,7 +2420,7 @@ mod tests {
             event,
             StreamEvent::SessionChanged {
                 session_id: "s".into(),
-                revision: 1
+                session_revision: 1
             }
         );
         // Comments and keepalives are ignored.
@@ -2267,9 +2512,16 @@ mod tests {
         assert_eq!(ClientError::NotFound("x".into()).exit_code(), 4);
         assert_eq!(ClientError::Unauthorized("x".into()).exit_code(), 70);
         assert_eq!(ClientError::Conflict("x".into()).exit_code(), 1);
+        assert_eq!(ClientError::IdempotencyMismatch("x".into()).exit_code(), 1);
+        assert_eq!(
+            ClientError::IdempotencyMismatch("x".into()).code(),
+            "idempotency_mismatch"
+        );
+        assert_eq!(ClientError::IdempotencyMismatch("x".into()).message(), "x");
         assert_eq!(ClientError::Internal("x".into()).exit_code(), 70);
         assert_eq!(ClientError::Internal("x".into()).code(), "internal");
-        assert_eq!(ClientError::Failed("x".into()).exit_code(), 1);
+        assert_eq!(ClientError::Unclassified("x".into()).exit_code(), 1);
+        assert_eq!(ClientError::Unclassified("x".into()).code(), "unclassified");
     }
 
     // -- mock server + orchestration ----------------------------------------
@@ -2358,7 +2610,7 @@ mod tests {
     impl SessionServer for MockServer {
         async fn resolve_workspace(&mut self, _root: &Path) -> Result<String, ClientError> {
             if self.fail_resolve {
-                return Err(ClientError::Failed("resolve failed".into()));
+                return Err(ClientError::Unclassified("resolve failed".into()));
             }
             if self.park_resolve {
                 std::future::pending::<()>().await;
@@ -2389,7 +2641,7 @@ mod tests {
             _binding: &Value,
         ) -> Result<u64, ClientError> {
             if self.fail_create {
-                return Err(ClientError::Failed("create rejected".into()));
+                return Err(ClientError::Unclassified("create rejected".into()));
             }
             if self.park_create {
                 if let Some(signal) = self.create_signal.take() {
@@ -2454,14 +2706,16 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or(Err(ClientError::Failed("snapshot queue empty".into())))
+                .unwrap_or(Err(ClientError::Unclassified(
+                    "snapshot queue empty".into(),
+                )))
         }
 
         async fn context_usage(
             &mut self,
             _session_id: &SessionId,
         ) -> Result<ContextUsage, ClientError> {
-            Err(ClientError::Failed(
+            Err(ClientError::Unclassified(
                 "context usage is not scripted on the mock server".into(),
             ))
         }
@@ -2470,7 +2724,7 @@ mod tests {
             &mut self,
             _session_id: &SessionId,
         ) -> Result<latte_core::ManualCompactionResult, ClientError> {
-            Err(ClientError::Failed(
+            Err(ClientError::Unclassified(
                 "manual compaction is not scripted on the mock server".into(),
             ))
         }
@@ -2514,7 +2768,7 @@ mod tests {
                     let _ = signal.send(());
                 }
                 if self.fail_reopen {
-                    return Err(ClientError::Failed("reconnect rejected".into()));
+                    return Err(ClientError::Unclassified("reconnect rejected".into()));
                 }
                 if self.park_reconnect {
                     // Park forever so tests can fire cancel into a pending
@@ -2528,7 +2782,7 @@ mod tests {
         async fn next_event(&mut self) -> Result<Option<StreamEvent>, ClientError> {
             // Simulate a transient SSE read error once.
             if std::mem::replace(&mut *self.read_error_once.lock().unwrap(), false) {
-                return Err(ClientError::Failed("simulated SSE read error".into()));
+                return Err(ClientError::Unclassified("simulated SSE read error".into()));
             }
             // Rewrite sentinel "self" session ids to the created session so
             // the observer's session filter sees them as its own; other ids
@@ -2547,11 +2801,11 @@ mod tests {
                     Some(created),
                     StreamEvent::SessionChanged {
                         session_id,
-                        revision,
+                        session_revision,
                     },
                 ) if session_id == "self" => StreamEvent::SessionChanged {
                     session_id: created,
-                    revision,
+                    session_revision,
                 },
                 (
                     Some(created),
@@ -2589,7 +2843,7 @@ mod tests {
         server.push_event(assistant_progress("self"));
         server.push_event(StreamEvent::SessionChanged {
             session_id: "self".into(),
-            revision: 2,
+            session_revision: 2,
         });
         server.push_snapshot(snapshot(
             SessionLifecycle::Ready,
@@ -2767,7 +3021,7 @@ mod tests {
         // second stream: a change event then terminal snapshot.
         server.push_event(StreamEvent::SessionChanged {
             session_id: "s".into(),
-            revision: 3,
+            session_revision: 3,
         });
         server.push_snapshot(snapshot(
             SessionLifecycle::Ready,
@@ -2831,7 +3085,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error, ClientError::Failed("resolve failed".into()));
+        assert_eq!(error, ClientError::Unclassified("resolve failed".into()));
 
         let mut server = MockServer::new();
         server.fail_binding = true;
@@ -3245,7 +3499,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(snapshot.revision, 3);
+        assert_eq!(snapshot.session_revision, 3);
         assert!(client.list_sessions(&ws).await.unwrap().is_empty());
         let revision = client
             .follow_up(
@@ -3267,7 +3521,7 @@ mod tests {
             event,
             StreamEvent::SessionChanged {
                 session_id: "s".into(),
-                revision: 9
+                session_revision: 9
             }
         );
         assert!(client.next_event().await.unwrap().is_none());
@@ -3805,7 +4059,7 @@ mod tests {
         let client = ServerClient::new(format!("http://127.0.0.1:{port}"), "token".into());
         let error = client.handle().list_sessions("ws").await.unwrap_err();
         // The body read failure maps to a Failed error (not Unreachable).
-        assert!(matches!(error, ClientError::Failed(_)), "{error:?}");
+        assert!(matches!(error, ClientError::Unclassified(_)), "{error:?}");
         handle.join().unwrap();
     }
 
@@ -3936,19 +4190,122 @@ mod tests {
             ClientError::Conflict("test message".into())
         );
         assert_eq!(
+            map_error_status(reqwest::StatusCode::UNPROCESSABLE_ENTITY, &body),
+            ClientError::IdempotencyMismatch("test message".into())
+        );
+        assert_eq!(
             map_error_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &body),
             ClientError::Internal("500 Internal Server Error: test message".into())
         );
         assert_eq!(
             map_error_status(reqwest::StatusCode::FORBIDDEN, &body),
-            ClientError::Failed("403 Forbidden: test message".into())
+            ClientError::Unclassified("403 Forbidden: test message".into())
         );
+        // Explicit `error.type` classifications take precedence over status code.
+        for (error_type, status, expected) in [
+            (
+                "unauthorized",
+                reqwest::StatusCode::FORBIDDEN,
+                ClientError::Unauthorized("typed".into()),
+            ),
+            (
+                "not_found",
+                reqwest::StatusCode::BAD_REQUEST,
+                ClientError::NotFound("typed".into()),
+            ),
+            (
+                "rejected",
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+                ClientError::Usage("typed".into()),
+            ),
+            (
+                "conflict",
+                reqwest::StatusCode::BAD_REQUEST,
+                ClientError::Conflict("typed".into()),
+            ),
+            (
+                "idempotency_mismatch",
+                reqwest::StatusCode::CONFLICT,
+                ClientError::IdempotencyMismatch("typed".into()),
+            ),
+            (
+                "failed",
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                ClientError::Internal("500 Internal Server Error: typed".into()),
+            ),
+        ] {
+            let typed = json!({"error": {"type": error_type, "message": "typed"}});
+            assert_eq!(map_error_status(status, &typed), expected);
+        }
         // Missing error.message falls back to "server error".
         let empty = json!({});
         assert_eq!(
             map_error_status(reqwest::StatusCode::BAD_REQUEST, &empty),
             ClientError::Usage("server error".into())
         );
+    }
+
+    #[test]
+    fn render_compact_and_envelope_cover_every_tier_and_idle_reason() {
+        use latte_core::{
+            ManualCompactionIdleReason as Reason, ManualCompactionResult, ManualCompactionState,
+            ManualCompactionTier as Tier,
+        };
+        let base = snapshot(SessionLifecycle::Ready, vec![]);
+        for (state, expected_status, expected_snippet) in [
+            (
+                ManualCompactionState::Compacted {
+                    tier: Tier::Elided,
+                    session_revision: 5,
+                },
+                "completed",
+                "session revision 5",
+            ),
+            (
+                ManualCompactionState::Compacted {
+                    tier: Tier::Summarized,
+                    session_revision: 9,
+                },
+                "completed",
+                "summarized older history",
+            ),
+            (
+                ManualCompactionState::NothingToCompact {
+                    reason: Reason::Empty,
+                },
+                "noop",
+                "no conversation history",
+            ),
+            (
+                ManualCompactionState::NothingToCompact {
+                    reason: Reason::Disabled,
+                },
+                "noop",
+                "disabled in the resolved profile",
+            ),
+            (
+                ManualCompactionState::NothingToCompact {
+                    reason: Reason::BreakerTripped,
+                },
+                "noop",
+                "temporarily unavailable",
+            ),
+            (
+                ManualCompactionState::NothingToCompact {
+                    reason: Reason::NothingToCompress,
+                },
+                "noop",
+                "below the smallest compaction boundary",
+            ),
+        ] {
+            let result = ManualCompactionResult {
+                snapshot: base.clone(),
+                state,
+            };
+            let envelope = compact_envelope(&result);
+            assert_eq!(envelope["status"], expected_status);
+            assert!(render_compact(&result).contains(expected_snippet));
+        }
     }
 
     #[test]
@@ -4209,7 +4566,7 @@ mod tests {
             decoder.line(""),
             Some(StreamEvent::SessionChanged {
                 session_id: "s".into(),
-                revision: 7,
+                session_revision: 7,
             })
         );
         // State is reset after dispatch.
@@ -4353,7 +4710,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error, ClientError::Failed("create rejected".into()));
+        assert_eq!(error, ClientError::Unclassified("create rejected".into()));
     }
 
     #[tokio::test]
@@ -4622,7 +4979,7 @@ mod tests {
         server.push_snapshot(snapshot(SessionLifecycle::Running, vec![]));
         server.push_event(StreamEvent::SessionChanged {
             session_id: "self".into(),
-            revision: 2,
+            session_revision: 2,
         });
         let cancel = async {
             let _ = rx.await;
@@ -4661,6 +5018,9 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error, ClientError::Failed("reconnect rejected".into()));
+        assert_eq!(
+            error,
+            ClientError::Unclassified("reconnect rejected".into())
+        );
     }
 }

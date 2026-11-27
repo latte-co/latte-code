@@ -1,6 +1,5 @@
 use crate::{
-    EngineHandle, Lease, SessionEffectDescriptor, SessionEffectExecutionError,
-    SessionEffectObservedValue,
+    EffectAuthority, EngineHandle, Lease, SessionEffectExecutionError, SessionEffectObservedValue,
 };
 use latte_core::TurnId;
 use serde::{Deserialize, Serialize};
@@ -94,6 +93,8 @@ pub enum ProcessError {
     InvalidApproval,
     #[error("process supervision unsupported on this platform")]
     Unsupported,
+    #[error("process failed to spawn: {0}")]
+    SpawnFailed(String),
     #[error("process supervision failed: {0}")]
     Supervision(String),
 }
@@ -128,35 +129,426 @@ impl CancellationToken {
     }
 }
 
+fn is_catastrophic_shell_text(shell: &str) -> bool {
+    let lower = shell.to_ascii_lowercase();
+    if lower.contains("--no-preserve-root") || lower.contains(":(){") {
+        return true;
+    }
+    for segment in split_shell_command_segments(shell) {
+        let tokens = tokenize_shell_words(&segment);
+        let unwrapped = unwrap_command_wrappers(&tokens);
+        if !unwrapped.is_empty() && is_catastrophic_argv(&unwrapped) {
+            return true;
+        }
+    }
+    false
+}
+
+fn split_shell_command_segments(shell: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = shell.chars().collect();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\\' && !in_single && i + 1 < chars.len() {
+            current.push(ch);
+            current.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            current.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            current.push(ch);
+            i += 1;
+            continue;
+        }
+        // Extract `$(...)` and `` `...` `` command substitutions even inside double quotes!
+        if !in_single && ch == '$' && i + 1 < chars.len() && chars[i + 1] == '(' {
+            let mut depth = 1usize;
+            let mut j = i + 2;
+            let mut inner = String::new();
+            while j < chars.len() && depth > 0 {
+                if chars[j] == '(' {
+                    depth += 1;
+                } else if chars[j] == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                inner.push(chars[j]);
+                j += 1;
+            }
+            segments.extend(split_shell_command_segments(&inner));
+            i = (j + 1).min(chars.len());
+            continue;
+        }
+        if !in_single && ch == '`' {
+            let mut j = i + 1;
+            let mut inner = String::new();
+            while j < chars.len() && chars[j] != '`' {
+                if chars[j] == '\\' && j + 1 < chars.len() {
+                    inner.push(chars[j + 1]);
+                    j += 2;
+                } else {
+                    inner.push(chars[j]);
+                    j += 1;
+                }
+            }
+            segments.extend(split_shell_command_segments(&inner));
+            i = (j + 1).min(chars.len());
+            continue;
+        }
+        if !in_single && !in_double && matches!(ch, ';' | '|' | '&' | '\n' | '\r' | '(' | ')') {
+            if current.trim().is_empty() {
+                current.clear();
+            } else {
+                segments.push(std::mem::take(&mut current));
+            }
+            i += 1;
+            continue;
+        }
+        current.push(ch);
+        i += 1;
+    }
+    if !current.trim().is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+fn tokenize_shell_words(segment: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut active = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let chars: Vec<char> = segment.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\\' && !in_single && i + 1 < chars.len() {
+            word.push(chars[i + 1]);
+            active = true;
+            i += 2;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            active = true;
+            i += 1;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            active = true;
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_double && ch.is_ascii_whitespace() {
+            if active {
+                words.push(std::mem::take(&mut word));
+                active = false;
+            }
+            i += 1;
+            continue;
+        }
+        word.push(ch);
+        active = true;
+        i += 1;
+    }
+    if active {
+        words.push(word);
+    }
+    words
+}
+
+fn unwrap_command_wrappers(tokens: &[String]) -> Vec<String> {
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        let tok = &tokens[idx];
+        // Skip leading `VAR=value` assignments.
+        if !tok.starts_with('-')
+            && let Some((lhs, _)) = tok.split_once('=')
+            && !lhs.is_empty()
+            && lhs.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            idx += 1;
+            continue;
+        }
+        let base = std::path::Path::new(tok)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(tok.as_str())
+            .to_ascii_lowercase();
+        match base.as_str() {
+            "sudo" => {
+                idx += 1;
+                while idx < tokens.len() {
+                    let flag = tokens[idx].as_str();
+                    if flag == "--" {
+                        idx += 1;
+                        break;
+                    }
+                    if matches!(
+                        flag,
+                        "-u" | "-g"
+                            | "-C"
+                            | "-D"
+                            | "-h"
+                            | "-p"
+                            | "-R"
+                            | "-T"
+                            | "-U"
+                            | "--user"
+                            | "--group"
+                            | "--chdir"
+                            | "--host"
+                            | "--prompt"
+                    ) {
+                        idx = (idx + 2).min(tokens.len());
+                    } else if flag.starts_with('-') {
+                        idx += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "env" => {
+                idx += 1;
+                while idx < tokens.len() {
+                    let flag = tokens[idx].as_str();
+                    if flag == "--" {
+                        idx += 1;
+                        break;
+                    }
+                    if matches!(flag, "-u" | "-C" | "--unset" | "--chdir") {
+                        idx = (idx + 2).min(tokens.len());
+                    } else if flag.starts_with('-') || flag.contains('=') {
+                        idx += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "nice" => {
+                idx += 1;
+                if idx < tokens.len() && matches!(tokens[idx].as_str(), "-n" | "--adjustment") {
+                    idx = (idx + 2).min(tokens.len());
+                } else if idx < tokens.len() && tokens[idx].starts_with('-') {
+                    idx += 1;
+                }
+            }
+            "command" | "nohup" | "exec" | "time" => {
+                idx += 1;
+                while idx < tokens.len() && tokens[idx].starts_with('-') {
+                    let is_end = tokens[idx] == "--";
+                    idx += 1;
+                    if is_end {
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    tokens[idx..].to_vec()
+}
+
+fn is_catastrophic_argv(argv: &[String]) -> bool {
+    let unwrapped = unwrap_command_wrappers(argv);
+    let argv = if unwrapped.is_empty() {
+        return argv.is_empty();
+    } else {
+        unwrapped.as_slice()
+    };
+    let Some(first) = argv.first() else {
+        return true;
+    };
+    let prog = std::path::Path::new(first)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(first.as_str())
+        .to_ascii_lowercase();
+    if prog == "mkfs" || prog.starts_with("mkfs.") {
+        return true;
+    }
+    if prog == "dd"
+        && argv[1..].iter().any(|arg| {
+            arg.to_ascii_lowercase().starts_with("of=/dev/")
+                && !arg.to_ascii_lowercase().starts_with("of=/dev/null")
+        })
+    {
+        return true;
+    }
+    if matches!(prog.as_str(), "sh" | "bash" | "zsh") {
+        let mut iter = argv.iter().skip(1);
+        while let Some(arg) = iter.next() {
+            if arg == "-c" || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c'))
+            {
+                if let Some(script) = iter.next()
+                    && is_catastrophic_shell_text(script)
+                {
+                    return true;
+                }
+                break;
+            }
+        }
+    }
+    if prog == "rm" {
+        let mut recursive = false;
+        let mut no_preserve_root = false;
+        let mut targets_root = false;
+        let mut after_double_dash = false;
+        for arg in argv.iter().skip(1) {
+            if !after_double_dash && arg == "--" {
+                after_double_dash = true;
+                continue;
+            }
+            if !after_double_dash && let Some(long) = arg.strip_prefix("--") {
+                match long {
+                    "recursive" => recursive = true,
+                    "no-preserve-root" => no_preserve_root = true,
+                    _ => {}
+                }
+                continue;
+            }
+            if !after_double_dash && arg.starts_with('-') && arg.len() > 1 {
+                for ch in arg[1..].chars() {
+                    if matches!(ch, 'r' | 'R') {
+                        recursive = true;
+                    }
+                }
+                continue;
+            }
+            let trimmed = arg.trim_end_matches('/');
+            if matches!(
+                arg.as_str(),
+                "/" | "/*"
+                    | "/."
+                    | "/.."
+                    | "~"
+                    | "~/*"
+                    | "$HOME"
+                    | "$HOME/*"
+                    | "${HOME}"
+                    | "${HOME}/*"
+            ) || trimmed.is_empty()
+                || trimmed == "/*"
+            {
+                targets_root = true;
+            }
+        }
+        if no_preserve_root || (recursive && targets_root) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_safe_relative_arg(arg: &str) -> bool {
+    !arg.is_empty()
+        && !std::path::Path::new(arg).is_absolute()
+        && !std::path::Path::new(arg)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+fn is_safe_readonly_git(argv: &[String]) -> bool {
+    let Some(first) = argv.first() else {
+        return false;
+    };
+    if !matches!(first.as_str(), "git" | "/usr/bin/git")
+        || argv.len() < 2
+        || resolve_trusted_git_binary().is_none()
+    {
+        return false;
+    }
+    // Reject any leading `git -c ...` or `--git-dir` / `--work-tree` overrides,
+    // and never auto-allow `git status` (which refreshes `.git/index` and can
+    // execute repository-configured clean/process filters).
+    match argv[1].as_str() {
+        "branch" => argv[2..] == ["--show-current"],
+        "rev-parse" => {
+            argv.len() == 3 && matches!(argv[2].as_str(), "HEAD" | "--abbrev-ref" | "--short")
+        }
+        _ => false,
+    }
+}
+
 #[must_use]
 pub fn classify(invocation: &ProcessInvocation<'_>) -> ProcessDecision {
     if let Some(shell) = invocation.shell {
-        let lower = shell.to_ascii_lowercase();
-        if lower.contains("rm -rf /") || lower.contains(":(){") || lower.contains("mkfs") {
+        if is_catastrophic_shell_text(shell) {
             ProcessDecision::Deny
         } else {
             ProcessDecision::Ask
         }
     } else {
-        let Some(command) = invocation.argv.first() else {
+        if is_catastrophic_argv(invocation.argv) {
             return ProcessDecision::Deny;
-        };
+        }
+        let command = &invocation.argv[0];
         let safe_grep = command == "/usr/bin/grep"
             && invocation.argv.len() == 4
             && invocation.argv[1] == "-q"
             && !invocation.argv[2].is_empty()
-            && !std::path::Path::new(&invocation.argv[3]).is_absolute()
-            && !std::path::Path::new(&invocation.argv[3])
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir));
+            && is_safe_relative_arg(&invocation.argv[3]);
+        let safe_single =
+            matches!(command.as_str(), "/bin/pwd" | "pwd") && invocation.argv.len() == 1;
+        let safe_which = matches!(command.as_str(), "/usr/bin/which" | "which")
+            && invocation.argv.len() == 2
+            && !invocation.argv[1].starts_with('-');
+        let safe_ls = matches!(command.as_str(), "/bin/ls" | "ls")
+            && invocation.argv.len() <= 4
+            && invocation.argv[1..].iter().all(|arg| {
+                matches!(arg.as_str(), "-l" | "-a" | "-la" | "-al" | "-1" | "-F")
+                    || (!arg.starts_with('-') && is_safe_relative_arg(arg))
+            });
         if invocation.env.is_empty()
-            && ((command == "/bin/pwd" && invocation.argv.len() == 1) || safe_grep)
+            && (safe_single
+                || safe_which
+                || safe_grep
+                || safe_ls
+                || is_safe_readonly_git(invocation.argv))
         {
             ProcessDecision::Allow
         } else {
             ProcessDecision::Ask
         }
     }
+}
+
+pub(crate) fn is_readonly_process_input(input: &Value) -> bool {
+    let Ok(spec) = SessionProcessSpec::from_input(input) else {
+        return false;
+    };
+    let invocation = ProcessInvocation {
+        argv: &spec.argv,
+        shell: spec.shell.as_deref(),
+        cwd: &spec.cwd,
+        env: &spec.env,
+        timeout_ms: spec.timeout_ms,
+        grace_ms: spec.grace_ms,
+        stdout_cap: spec.stdout_cap,
+        stderr_cap: spec.stderr_cap,
+        turn_revision: 0,
+        effect_id: "classify-probe",
+        attempt: 1,
+        approval_digest: None,
+        lease_owner: "probe",
+        lease_token: 0,
+    };
+    classify(&invocation) == ProcessDecision::Allow
 }
 
 #[derive(Serialize)]
@@ -298,7 +690,7 @@ impl SessionProcessSpec {
     pub(crate) fn invocation<'a>(
         &'a self,
         turn_revision: u64,
-        descriptor: &'a SessionEffectDescriptor,
+        authority: &'a EffectAuthority,
         lease: &'a Lease,
     ) -> ProcessInvocation<'a> {
         ProcessInvocation {
@@ -311,8 +703,8 @@ impl SessionProcessSpec {
             stdout_cap: self.stdout_cap,
             stderr_cap: self.stderr_cap,
             turn_revision,
-            effect_id: &descriptor.effect_id,
-            attempt: descriptor.attempt,
+            effect_id: authority.effect_id.as_str(),
+            attempt: authority.attempt,
             approval_digest: None,
             lease_owner: lease.owner(),
             lease_token: lease.fencing_token(),
@@ -323,7 +715,7 @@ impl SessionProcessSpec {
 impl EngineHandle {
     pub(crate) async fn execute_started_session_process(
         &self,
-        descriptor: &SessionEffectDescriptor,
+        authority: &EffectAuthority,
         turn_revision: u64,
         lease: &Lease,
         cancellation: &CancellationToken,
@@ -333,13 +725,13 @@ impl EngineHandle {
                 ProcessError::Unsupported.to_string(),
             ));
         }
-        let spec = SessionProcessSpec::from_input(&descriptor.input)
-            .map_err(|error| SessionEffectExecutionError::Uncertain(error.to_string()))?;
-        let invocation = spec.invocation(turn_revision, descriptor, lease);
+        let spec = SessionProcessSpec::from_input(&authority.input)
+            .map_err(|error| SessionEffectExecutionError::Certified(error.to_string()))?;
+        let invocation = spec.invocation(turn_revision, authority, lease);
         let cwd = self
             .tools
             .resolve_cwd(&spec.cwd)
-            .map_err(|error| SessionEffectExecutionError::Uncertain(error.to_string()))?;
+            .map_err(|error| SessionEffectExecutionError::Certified(error.to_string()))?;
         let _operation = std::sync::Arc::clone(&self.operation_gate)
             .acquire_owned()
             .await
@@ -357,15 +749,30 @@ impl EngineHandle {
                     "process cancelled after its external outcome may have happened".into(),
                 ))
             }
-            Ok(output) => Ok(SessionEffectObservedValue {
-                result: serde_json::to_string(&output).unwrap_or_else(|_| "{}".into()),
-                payload: Some(latte_core::redact_session_value(serde_json::json!({
-                    "tool_call_id":descriptor.tool_call_id,
-                    "name":descriptor.name,
-                    "output":output,
-                }))),
-                success: true,
-            }),
+            Ok(output) => {
+                let succeeded = output.command_succeeded();
+                let result = serde_json::to_string(&output).unwrap_or_else(|_| "{}".into());
+                let mut payload = serde_json::json!({
+                    "tool_call_id": authority.tool_call_id,
+                    "name": authority.name,
+                    "exit_code": output.exit_code,
+                    "termination": output.termination,
+                });
+                if !succeeded {
+                    payload["error"] = serde_json::Value::String(format!(
+                        "process exited with {:?} ({:?})",
+                        output.exit_code, output.termination
+                    ));
+                }
+                Ok(SessionEffectObservedValue {
+                    result,
+                    payload: Some(latte_core::redact_session_value(payload)),
+                    success: succeeded,
+                })
+            }
+            Err(error @ ProcessError::SpawnFailed(_)) => {
+                Err(SessionEffectExecutionError::Certified(error.to_string()))
+            }
             Err(error) => Err(SessionEffectExecutionError::Uncertain(error.to_string())),
         }
     }
@@ -648,11 +1055,90 @@ fn storage(error: crate::StorageError) -> ProcessError {
     ProcessError::Supervision(format!("durable sequencing: {error}"))
 }
 
+fn resolve_trusted_git_binary() -> Option<&'static str> {
+    [
+        "/usr/bin/git",
+        "/opt/homebrew/bin/git",
+        "/usr/local/bin/git",
+    ]
+    .into_iter()
+    .find(|candidate| std::path::Path::new(candidate).is_file())
+}
+
+fn resolve_git_binary() -> &'static str {
+    resolve_trusted_git_binary().unwrap_or("git")
+}
+
+fn complete_nul_entries(raw: &str) -> impl Iterator<Item = &str> {
+    let complete = raw.rfind('\0').map_or("", |pos| &raw[..pos]);
+    complete.split('\0').filter(|entry| !entry.is_empty())
+}
+
 pub(crate) fn supervise_git_diff(
     cwd: &std::path::Path,
     cap: usize,
+    mut allow_path: impl FnMut(&str) -> bool,
 ) -> Result<(String, bool), ProcessError> {
-    supervise_git(cwd, cap, GitQuery::DiffStat)
+    const MAX_DIFF_PATH_LIST_BYTES: usize = 512 * 1024;
+    const MAX_DIFF_PATHS: usize = 512;
+
+    let (against_head, raw_paths, paths_truncated) = if let Ok((paths, truncated)) =
+        supervise_git(cwd, MAX_DIFF_PATH_LIST_BYTES, GitQuery::TrackedPathsZ)
+    {
+        (true, paths, truncated)
+    } else {
+        let (paths, truncated) =
+            supervise_git(cwd, MAX_DIFF_PATH_LIST_BYTES, GitQuery::IndexPathsZ)?;
+        (false, paths, truncated)
+    };
+    let mut allowed_paths = Vec::new();
+    let mut path_cap_hit = paths_truncated;
+    for path in complete_nul_entries(&raw_paths) {
+        if !allow_path(path) {
+            continue;
+        }
+        if allowed_paths.len() >= MAX_DIFF_PATHS {
+            path_cap_hit = true;
+            break;
+        }
+        allowed_paths.push(path.to_owned());
+    }
+    let (mut diff, mut truncated) = if allowed_paths.is_empty() {
+        (String::new(), path_cap_hit)
+    } else {
+        let query = if against_head {
+            GitQuery::UnifiedDiffHeadPaths(allowed_paths)
+        } else {
+            GitQuery::UnifiedDiffIndexPaths(allowed_paths)
+        };
+        let (patch, patch_truncated) = supervise_git(cwd, cap, query)?;
+        (patch, patch_truncated || path_cap_hit)
+    };
+    if !truncated
+        && diff.len() + 32 < cap
+        && let Ok((untracked, untracked_truncated)) =
+            supervise_git(cwd, MAX_DIFF_PATH_LIST_BYTES, GitQuery::UntrackedZ)
+    {
+        let files: Vec<&str> = complete_nul_entries(&untracked)
+            .filter(|entry| allow_path(entry))
+            .collect();
+        if !files.is_empty() {
+            if !diff.is_empty() && !diff.ends_with('\n') {
+                diff.push('\n');
+            }
+            diff.push_str("Untracked files:\n");
+            for file in files {
+                let line = format!("  {file}\n");
+                if diff.len() + line.len() > cap {
+                    truncated = true;
+                    break;
+                }
+                diff.push_str(&line);
+            }
+            truncated |= untracked_truncated;
+        }
+    }
+    Ok((diff, truncated))
 }
 pub(crate) fn supervise_git_changed_files(
     cwd: &std::path::Path,
@@ -677,9 +1163,13 @@ pub(crate) fn supervise_git_changed_files(
     ))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum GitQuery {
-    DiffStat,
+    UnifiedDiffHeadPaths(Vec<String>),
+    UnifiedDiffIndexPaths(Vec<String>),
+    TrackedPathsZ,
+    IndexPathsZ,
+    UntrackedZ,
     TrackedChanges,
     Untracked,
 }
@@ -700,7 +1190,7 @@ fn supervise_git(
             .map_err(|e| ProcessError::Supervision(e.to_string()))?;
         runtime.block_on(async move {
             let mut argv = vec![
-                "/usr/bin/git".into(),
+                resolve_git_binary().into(),
                 "--no-pager".into(),
                 "-c".into(),
                 "core.hooksPath=/dev/null".into(),
@@ -708,14 +1198,63 @@ fn supervise_git(
                 "diff.external=".into(),
                 "-c".into(),
                 "core.attributesFile=/dev/null".into(),
+                "-c".into(),
+                "core.fsmonitor=false".into(),
             ];
             match query {
-                GitQuery::DiffStat => argv.extend([
+                GitQuery::UnifiedDiffHeadPaths(paths) => {
+                    argv.extend([
+                        "diff".into(),
+                        "--patch-with-stat".into(),
+                        "--no-ext-diff".into(),
+                        "--no-textconv".into(),
+                        "HEAD".into(),
+                        "--".into(),
+                    ]);
+                    argv.extend(paths.into_iter().map(|path| format!(":(literal){path}")));
+                }
+                GitQuery::UnifiedDiffIndexPaths(paths) => {
+                    argv.extend([
+                        "diff".into(),
+                        "--patch-with-stat".into(),
+                        "--no-ext-diff".into(),
+                        "--no-textconv".into(),
+                        "--".into(),
+                    ]);
+                    argv.extend(paths.into_iter().map(|path| format!(":(literal){path}")));
+                }
+                GitQuery::TrackedPathsZ => argv.extend([
                     "diff".into(),
-                    "--stat".into(),
+                    "-z".into(),
+                    "--name-only".into(),
+                    "--no-ext-diff".into(),
+                    "--no-textconv".into(),
+                    "HEAD".into(),
+                    "--".into(),
+                    ".".into(),
+                    ":(exclude).latte/**".into(),
+                    ":(exclude)target/**".into(),
+                ]),
+                GitQuery::IndexPathsZ => argv.extend([
+                    "diff".into(),
+                    "-z".into(),
+                    "--name-only".into(),
                     "--no-ext-diff".into(),
                     "--no-textconv".into(),
                     "--".into(),
+                    ".".into(),
+                    ":(exclude).latte/**".into(),
+                    ":(exclude)target/**".into(),
+                ]),
+                GitQuery::UntrackedZ => argv.extend([
+                    "ls-files".into(),
+                    "-z".into(),
+                    "--others".into(),
+                    "--exclude-standard".into(),
+                    "--".into(),
+                    ".".into(),
+                    ":(exclude).latte/**".into(),
+                    ":(exclude)target/**".into(),
                 ]),
                 GitQuery::TrackedChanges => argv.extend([
                     "diff".into(),
@@ -742,6 +1281,7 @@ fn supervise_git(
                 ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
                 ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
                 ("GIT_CONFIG_SYSTEM".into(), "/dev/null".into()),
+                ("GIT_OPTIONAL_LOCKS".into(), "0".into()),
             ]);
             let invocation = ProcessInvocation {
                 argv: &argv,
@@ -769,6 +1309,39 @@ fn supervise_git(
     .join()
     .map_err(|_| ProcessError::Supervision("git supervisor session panicked".into()))?
 }
+
+#[cfg(unix)]
+const SAFE_INHERITED_ENV_KEYS: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "COLORTERM",
+    "NO_COLOR",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "GOPATH",
+    "GOROOT",
+    "NVM_DIR",
+    "PNPM_HOME",
+    "BUN_INSTALL",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "PYENV_ROOT",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+];
 
 #[cfg(unix)]
 async fn drain(
@@ -799,13 +1372,31 @@ async fn supervise(
 ) -> Result<ProcessOutput, ProcessError> {
     use std::os::unix::process::CommandExt;
     if cancel.is_cancelled() {
-        return Err(ProcessError::Supervision(
+        return Err(ProcessError::SpawnFailed(
             "process cancelled before it could be started".into(),
         ));
     }
+    let readonly_git = i.shell.is_none() && is_safe_readonly_git(i.argv);
     let mut command = if let Some(shell) = i.shell {
         let mut c = Command::new("/bin/sh");
         c.args(["-c", shell]);
+        c
+    } else if readonly_git {
+        let git_bin = resolve_trusted_git_binary()
+            .ok_or_else(|| ProcessError::SpawnFailed("trusted git binary not found".into()))?;
+        let mut c = Command::new(git_bin);
+        c.args([
+            "--no-pager",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "diff.external=",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+        ]);
+        c.args(&i.argv[1..]);
         c
     } else {
         let mut c = Command::new(&i.argv[0]);
@@ -815,13 +1406,26 @@ async fn supervise(
     command
         .current_dir(cwd)
         .env_clear()
-        .envs(i.env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for key in SAFE_INHERITED_ENV_KEYS {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    if readonly_git {
+        command.envs([
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_SYSTEM", "/dev/null"),
+            ("GIT_OPTIONAL_LOCKS", "0"),
+        ]);
+    }
+    command.envs(i.env);
     command.as_std_mut().process_group(0);
     let mut child = command
         .spawn()
-        .map_err(|e| ProcessError::Supervision(e.to_string()))?;
+        .map_err(|e| ProcessError::SpawnFailed(e.to_string()))?;
     let pid = child
         .id()
         .ok_or_else(|| ProcessError::Supervision("missing child pid".into()))?;
@@ -1119,7 +1723,7 @@ mod tests {
             classify(&invocation(None, &empty, "empty", &lease, None)),
             ProcessDecision::Deny
         );
-        for dangerous in [":(){ :|:& };:", "mkfs.ext4 /dev/test"] {
+        for dangerous in [":(){ :|:& };:", "mkfs.ext4 /dev/test", "rm -fr /"] {
             assert_eq!(
                 classify(&invocation(
                     Some(dangerous),
@@ -1129,6 +1733,61 @@ mod tests {
                     None
                 )),
                 ProcessDecision::Deny
+            );
+        }
+        for dangerous_argv in [
+            vec!["rm".into(), "-rf".into(), "/".into()],
+            vec![
+                "/bin/rm".into(),
+                "--recursive".into(),
+                "--force".into(),
+                "/*".into(),
+            ],
+            vec![
+                "rm".into(),
+                "--no-preserve-root".into(),
+                "-rf".into(),
+                "dir".into(),
+            ],
+            vec!["/sbin/mkfs.ext4".into(), "/dev/null".into()],
+            vec!["/bin/sh".into(), "-c".into(), "rm -rf /".into()],
+        ] {
+            assert_eq!(
+                classify(&invocation(
+                    None,
+                    &dangerous_argv,
+                    "argv-deny",
+                    &lease,
+                    None
+                )),
+                ProcessDecision::Deny
+            );
+        }
+        let safe_rm_rel = vec!["rm".into(), "--".into(), "-rf".into(), "local.tmp".into()];
+        assert_eq!(
+            classify(&invocation(None, &safe_rm_rel, "rm-rel", &lease, None)),
+            ProcessDecision::Ask
+        );
+        for allowed_ro in [
+            vec!["git".into(), "branch".into(), "--show-current".into()],
+            vec!["git".into(), "rev-parse".into(), "HEAD".into()],
+            vec!["ls".into(), "-la".into(), "src".into()],
+        ] {
+            assert_eq!(
+                classify(&invocation(None, &allowed_ro, "ro", &lease, None)),
+                ProcessDecision::Allow
+            );
+        }
+        for gated_git in [
+            vec!["git".into()],
+            vec!["git".into(), "commit".into(), "-m".into(), "x".into()],
+            vec!["git".into(), "status".into(), "--short".into()],
+            vec!["git".into(), "status".into(), "--ignored=matching".into()],
+            vec!["ls".into(), "/etc".into()],
+        ] {
+            assert_eq!(
+                classify(&invocation(None, &gated_git, "gated", &lease, None)),
+                ProcessDecision::Ask
             );
         }
         let safe_grep = vec![
@@ -1233,8 +1892,8 @@ mod tests {
             fencing_token: 7,
             expires_at_ms: 99,
         };
-        let descriptor = SessionEffectDescriptor {
-            effect_id: "effect".into(),
+        let descriptor = EffectAuthority {
+            effect_id: "effect".parse().unwrap(),
             tool_call_id: "call_1".into(),
             name: "process".into(),
             input: serde_json::json!({}),
@@ -1423,8 +2082,8 @@ mod tests {
             );
         }
 
-        let descriptor = SessionEffectDescriptor {
-            effect_id: "session-process".into(),
+        let descriptor = EffectAuthority {
+            effect_id: "session-process".parse().unwrap(),
             tool_call_id: "call".into(),
             name: "process".into(),
             input: serde_json::json!({"argv":["/bin/echo","ok"]}),
@@ -1799,7 +2458,7 @@ mod tests {
             .unwrap();
         // Modify the file to produce a diff.
         std::fs::write(repo.join("file.txt"), "modified content\n").unwrap();
-        let (output, truncated) = supervise_git_diff(repo, 65536).unwrap();
+        let (output, truncated) = supervise_git_diff(repo, 65536, |_| true).unwrap();
         assert!(!output.is_empty());
         assert!(!truncated);
     }
@@ -1935,5 +2594,273 @@ mod tests {
             )
             .unwrap();
         assert!(!new_digest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_process_certifies_enoent_inherits_safe_path_and_unified_git_diff_includes_untracked()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::EngineBuilder::new()
+            .workspace_root(dir.path())
+            .build()
+            .unwrap();
+        let lease = engine.acquire_lease("owner", 1, 10_000).unwrap();
+
+        // Missing binary fails at spawn with zero external side effects → Certified, not Uncertain!
+        let missing = EffectAuthority {
+            effect_id: "missing-bin".parse().unwrap(),
+            tool_call_id: "call-missing".into(),
+            name: "process".into(),
+            input: serde_json::json!({"argv":["/nonexistent/latte-missing-binary-xyz"]}),
+            attempt: 1,
+        };
+        assert!(matches!(
+            engine
+                .execute_started_session_process(&missing, 0, &lease, &CancellationToken::new())
+                .await,
+            Err(SessionEffectExecutionError::Certified(msg)) if msg.contains("failed to spawn")
+        ));
+
+        // Non-zero exit code sets success=false while returning full stdout/stderr JSON.
+        let nonzero = EffectAuthority {
+            effect_id: "nonzero-exit".parse().unwrap(),
+            tool_call_id: "call-nonzero".into(),
+            name: "process".into(),
+            input: serde_json::json!({"shell":"printf '$PATH'; exit 7"}),
+            attempt: 1,
+        };
+        let observed = engine
+            .execute_started_session_process(&nonzero, 0, &lease, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!observed.success);
+        let parsed: ProcessOutput = serde_json::from_str(&observed.result).unwrap();
+        assert_eq!(parsed.exit_code, Some(7));
+        assert!(!parsed.stdout.is_empty(), "PATH should be inherited");
+
+        // Readonly classifier helper.
+        assert!(is_readonly_process_input(
+            &serde_json::json!({"argv":["pwd"]})
+        ));
+        assert!(is_readonly_process_input(
+            &serde_json::json!({"argv":["which","sh"]})
+        ));
+        assert!(!is_readonly_process_input(
+            &serde_json::json!({"shell":"rm -f a"})
+        ));
+        assert!(!is_readonly_process_input(&serde_json::json!("bad")));
+
+        // Unified git_diff works in unborn repo AND committed repo with untracked file.
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        std::fs::write(dir.path().join("untracked.rs"), "fn main() {}\n").unwrap();
+        let (unborn_diff, _) = supervise_git_diff(dir.path(), 65536, |_| true).unwrap();
+        assert!(unborn_diff.contains("untracked.rs"), "{unborn_diff}");
+    }
+
+    #[tokio::test]
+    async fn readonly_git_status_neutralizes_repo_fsmonitor_and_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("fsmonitor-pwned");
+        let helper = dir.path().join("evil-fsmonitor.sh");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\ntouch {}\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.path().join("tracked.txt"), "v1\n").unwrap();
+
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "tracked.txt"],
+            vec!["commit", "-qm", "init"],
+            vec!["config", "core.fsmonitor", helper.to_str().unwrap()],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(dir.path().join("tracked.txt"), "v2\n").unwrap();
+
+        let argv = vec!["git".to_owned(), "status".to_owned(), "--short".to_owned()];
+        let env = BTreeMap::new();
+        let inv = ProcessInvocation {
+            argv: &argv,
+            shell: None,
+            cwd: ".",
+            env: &env,
+            timeout_ms: 5_000,
+            grace_ms: 100,
+            stdout_cap: 16_384,
+            stderr_cap: 16_384,
+            turn_revision: 1,
+            effect_id: "git-status-safe",
+            attempt: 1,
+            approval_digest: None,
+            lease_owner: "o",
+            lease_token: 1,
+        };
+        assert_eq!(
+            classify(&inv),
+            ProcessDecision::Ask,
+            "git status can trigger clean/smudge filters via .gitattributes and must require approval"
+        );
+        assert!(!is_readonly_process_input(
+            &serde_json::json!({"argv":["git","status","--short"]})
+        ));
+        let ro_argv = vec!["git".to_owned(), "rev-parse".to_owned(), "HEAD".to_owned()];
+        let ro_inv = ProcessInvocation {
+            argv: &ro_argv,
+            shell: None,
+            cwd: ".",
+            env: &env,
+            timeout_ms: 5_000,
+            grace_ms: 100,
+            stdout_cap: 16_384,
+            stderr_cap: 16_384,
+            turn_revision: 1,
+            effect_id: "git-rev-parse-safe",
+            attempt: 1,
+            approval_digest: None,
+            lease_owner: "o",
+            lease_token: 1,
+        };
+        assert_eq!(classify(&ro_inv), ProcessDecision::Allow);
+        let out = supervise(&ro_inv, dir.path(), &CancellationToken::new(), None)
+            .await
+            .unwrap();
+        assert!(out.command_succeeded(), "{out:?}");
+        assert_eq!(out.stdout.trim().len(), 40, "{out:?}");
+        assert!(
+            !marker.exists(),
+            "auto-allowed readonly git must never execute repo core.fsmonitor"
+        );
+    }
+
+    #[test]
+    fn catastrophic_shell_classifier_catches_split_flags_wrappers_and_subshells() {
+        let env = BTreeMap::new();
+        for dangerous in [
+            "rm -r -f /*",
+            "rm --recursive --force /",
+            "rm   -rf   /",
+            "sudo rm -rf /",
+            "sudo -u root rm -f -r /*",
+            "env FOO=1 command rm -rf /",
+            "(rm -rf /)",
+            "echo ok && $(rm -r -f /)",
+            "echo `mkfs.ext4 /dev/sda`",
+            "nohup dd of=/dev/sda if=/dev/zero",
+        ] {
+            let inv = ProcessInvocation {
+                argv: &[],
+                shell: Some(dangerous),
+                cwd: ".",
+                env: &env,
+                timeout_ms: 1_000,
+                grace_ms: 100,
+                stdout_cap: 1024,
+                stderr_cap: 1024,
+                turn_revision: 1,
+                effect_id: "catastrophic-shell",
+                attempt: 1,
+                approval_digest: None,
+                lease_owner: "o",
+                lease_token: 1,
+            };
+            assert_eq!(
+                classify(&inv),
+                ProcessDecision::Deny,
+                "expected Deny for shell command: {dangerous}"
+            );
+        }
+
+        for ask_only in [
+            "rm -rf target",
+            "echo 'rm -rf /' > note.txt",
+            "git status --short",
+        ] {
+            let inv = ProcessInvocation {
+                argv: &[],
+                shell: Some(ask_only),
+                cwd: ".",
+                env: &env,
+                timeout_ms: 1_000,
+                grace_ms: 100,
+                stdout_cap: 1024,
+                stderr_cap: 1024,
+                turn_revision: 1,
+                effect_id: "ask-shell",
+                attempt: 1,
+                approval_digest: None,
+                lease_owner: "o",
+                lease_token: 1,
+            };
+            assert_eq!(
+                classify(&inv),
+                ProcessDecision::Ask,
+                "expected Ask for shell command: {ask_only}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_diff_treats_glob_named_files_literally_and_drops_truncated_nul_tail() {
+        let entries: Vec<&str> = complete_nul_entries("a.rs\0b.rs\0partial_tail").collect();
+        assert_eq!(entries, vec!["a.rs", "b.rs"]);
+        assert!(complete_nul_entries("unterminated_only").next().is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".latte")).unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("*"), "star-v1\n").unwrap();
+        std::fs::write(dir.path().join(".latte/state.txt"), "latte-v1\n").unwrap();
+        std::fs::write(dir.path().join("target/out.txt"), "target-v1\n").unwrap();
+
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "-f", "*", ".latte/state.txt", "target/out.txt"],
+            vec!["commit", "-qm", "init"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        std::fs::write(dir.path().join("*"), "star-v2\n").unwrap();
+        std::fs::write(dir.path().join(".latte/state.txt"), "LATTE_INTERNAL_DIFF\n").unwrap();
+        std::fs::write(dir.path().join("target/out.txt"), "TARGET_BUILD_DIFF\n").unwrap();
+
+        let (diff, truncated) = supervise_git_diff(dir.path(), 65_536, |_| true).unwrap();
+        assert!(!truncated);
+        assert!(diff.contains("star-v2"), "{diff}");
+        assert!(
+            !diff.contains("LATTE_INTERNAL_DIFF"),
+            "literal pathspec must prevent '*' from expanding into .latte/: {diff}"
+        );
+        assert!(
+            !diff.contains("TARGET_BUILD_DIFF"),
+            "literal pathspec must prevent '*' from expanding into target/: {diff}"
+        );
     }
 }

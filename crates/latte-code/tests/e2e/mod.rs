@@ -11,7 +11,6 @@ mod projection;
 mod provider;
 mod public_boundary_matrix;
 mod public_lifecycle_matrix;
-mod public_logic_boundary;
 mod recovery;
 mod runtime;
 mod runtime_convergence;

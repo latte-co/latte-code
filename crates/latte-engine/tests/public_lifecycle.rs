@@ -1,5 +1,6 @@
 use latte_core::{
-    CommandId, EventId, IdSource, RuntimeEvent, SystemIdSource, Transition, TurnId, TurnStatus,
+    EventId, IdSource, RuntimeEvent, SessionCommandId, SystemIdSource, Transition, TurnId,
+    TurnStatus,
 };
 use latte_engine::{EffectStatus, EngineBuilder, StorageError, ToolError, ToolInvocation};
 use serde_json::json;
@@ -16,10 +17,10 @@ fn ids() -> (TurnId, EventId) {
 fn typed_ids_expose_their_underlying_uuid_without_string_roundtrips() {
     let source = SystemIdSource::default();
     let run = TurnId::from_uuid(source.next_uuid_v7());
-    let command = CommandId::from_uuid(source.next_uuid_v7());
+    let command = SessionCommandId::from_uuid(source.next_uuid_v7());
     let event = EventId::from_uuid(source.next_uuid_v7());
     assert_eq!(TurnId::from_uuid(run.as_uuid()), run);
-    assert_eq!(CommandId::from_uuid(command.as_uuid()), command);
+    assert_eq!(SessionCommandId::from_uuid(command.as_uuid()), command);
     assert_eq!(EventId::from_uuid(event.as_uuid()), event);
 }
 

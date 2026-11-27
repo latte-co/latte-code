@@ -15,16 +15,17 @@ use crate::{
     runtime::VerificationPlan,
 };
 use latte_core::{
-    ContextPolicy, FailureCode, Retryability, SessionCommandId, SessionId, SessionLifecycle,
-    SessionProviderBinding, SessionSnapshot, SessionTransientProgress, TranscriptKind, TurnFailure,
-    TurnId, redact_session_text, valid_openai_chat_input_request_id, wall_time_ms as now_ms,
+    ContextPolicy, EffectId, FailureCode, Retryability, RoundId, SessionCommandId,
+    SessionEffectKind, SessionId, SessionLifecycle, SessionProviderBinding, SessionSnapshot,
+    SessionTransientProgress, TranscriptKind, TurnFailure, TurnId, redact_session_text,
+    valid_openai_chat_input_request_id, wall_time_ms as now_ms,
 };
 use latte_engine::{
-    CancellationToken, CommitSessionTurnUpdate, EngineHandle, Lease, SessionCommitRequest,
-    SessionEffectDescriptor, SessionEffectExecutionError, SessionEffectPresentation,
-    SessionEffectRequest, SessionEffectStartRequest, SessionEffectStarted,
-    SessionLeaseLossRecovery, StorageError,
+    CancellationToken, CommitSessionTurnUpdate, EffectAuthority, EffectView, EngineHandle, Lease,
+    SessionCommitRequest, SessionEffectExecutionError, SessionEffectRequest,
+    SessionEffectStartRequest, SessionEffectStarted, SessionLeaseLossRecovery, StorageError,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
@@ -35,12 +36,6 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-const SESSION_VERIFICATION_EFFECT_PREFIX: &str = "session-verification:";
-/// Pre-rename (schema <13) prefix minted into durable verification effect ids.
-/// A verification effect left `waiting_permission` by an old binary carries this
-/// id; after upgrade its approval must still be routed as verification rather
-/// than a normal provider tool continuation.
-const LEGACY_THREAD_VERIFICATION_EFFECT_PREFIX: &str = "thread-verification:";
 const SESSION_MAILBOX_CAPACITY: usize = 8;
 /// Per-session consecutive compaction failures (provider error, empty reply,
 /// or oversized product) after which the loop stops attempting summaries
@@ -54,12 +49,12 @@ const RESIDUE_SETTLE_INTERVAL_MS: u64 = 5;
 /// over while keeping a misbehaving-residue worst case bounded.
 const RESIDUE_SETTLE_BUDGET_MS: u64 = 100;
 
-/// Identifies a verification effect whether it was minted by a current binary
-/// (`session-verification:`) or persisted before the Thread→Session rename
-/// (`thread-verification:`).
-fn is_verification_effect_id(request_id: &str) -> bool {
-    request_id.starts_with(SESSION_VERIFICATION_EFFECT_PREFIX)
-        || request_id.starts_with(LEGACY_THREAD_VERIFICATION_EFFECT_PREFIX)
+fn bounded_source_key(prefix: &str, raw: String) -> String {
+    if raw.len() <= 256 {
+        raw
+    } else {
+        format!("{prefix}:sha256:{:x}", Sha256::digest(raw.as_bytes()))
+    }
 }
 
 /// Whether some assistant message in this segment declared `tool_call_id`.
@@ -78,16 +73,27 @@ fn declared_tool_call(segment: &[Message], tool_call_id: &str) -> bool {
     })
 }
 
+fn is_readonly_session_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "list_directory" | "search" | "read_project_manifest" | "git_diff"
+    )
+}
+
 fn append_denied_tool_results(segment: &mut Vec<Message>) {
-    let calls = segment
-        .iter()
-        .rev()
-        .find_map(|message| match message {
-            Message::Assistant { tool_calls, .. } => Some(tool_calls.clone()),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let observed = segment
+    let Some((last_assistant_idx, calls)) =
+        segment
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(idx, message)| match message {
+                Message::Assistant { tool_calls, .. } => Some((idx, tool_calls.clone())),
+                _ => None,
+            })
+    else {
+        return;
+    };
+    let observed = segment[last_assistant_idx + 1..]
         .iter()
         .filter_map(|message| match message {
             Message::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
@@ -101,6 +107,30 @@ fn append_denied_tool_results(segment: &mut Vec<Message>) {
             content: "permission denied by user; tool was not executed".into(),
         })
     }));
+}
+
+fn redact_thinking_blocks(
+    blocks: &[crate::provider::ThinkingBlock],
+) -> Vec<crate::provider::ThinkingBlock> {
+    blocks
+        .iter()
+        .map(|block| match block {
+            crate::provider::ThinkingBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                let redacted = redact_session_text(thinking);
+                let preserved_sig = (redacted == *thinking).then(|| signature.clone()).flatten();
+                crate::provider::ThinkingBlock::Thinking {
+                    thinking: redacted,
+                    signature: preserved_sig,
+                }
+            }
+            crate::provider::ThinkingBlock::RedactedThinking { data } => {
+                crate::provider::ThinkingBlock::RedactedThinking { data: data.clone() }
+            }
+        })
+        .collect()
 }
 
 /// Exact request-size policy for child history construction.
@@ -134,14 +164,14 @@ pub struct SessionHistoryPolicy {
 impl Default for SessionHistoryPolicy {
     fn default() -> Self {
         Self {
-            max_request_bytes: 512 * 1024,
-            max_input_bytes: 384 * 1024,
-            reserved_output_bytes: 128 * 1024,
-            context_cap_bytes: 64 * 1024,
+            max_request_bytes: 2 * 1024 * 1024,
+            max_input_bytes: 1536 * 1024,
+            reserved_output_bytes: 256 * 1024,
+            context_cap_bytes: 128 * 1024,
             // Unlimited by default. Wall-clock protection comes from the
             // per-request provider timeout and cancellation instead.
             max_tool_rounds: None,
-            provider_timeout_ms: 60_000,
+            provider_timeout_ms: 120_000,
         }
     }
 }
@@ -306,6 +336,10 @@ struct HistorySegment {
     /// consumes the sequences; projection replaces the matching `Tool`
     /// message with a deterministic skeleton.
     tool_results: Vec<(u64, String)>,
+    /// `(message_index, round_id)` for each `Message::Assistant` in `messages`,
+    /// kept updated as `Message::Tool` entries are inserted so reused
+    /// `tool_call_id`s across distinct rounds in the same turn never collide.
+    assistant_rounds: Vec<(usize, Option<String>)>,
 }
 
 /// Byte cap on one transient reminder AFTER redaction and BEFORE framing.
@@ -324,24 +358,41 @@ struct VolatileTurnContext {
 }
 
 impl VolatileTurnContext {
-    /// The two messages in wire order: repository snapshot then reminder.
-    fn messages(&self) -> Vec<Message> {
-        [self.repository.clone(), self.reminder.clone()]
-            .into_iter()
-            .flatten()
-            .collect()
-    }
-
-    /// Chronological fit entries for the volatile block: repository first
-    /// (dropped only after the reminder under pressure), reminder second
-    /// (newest, hence most discardable).
-    fn fit_entries(&self) -> Vec<FitEntry> {
-        let mut entries = Vec::new();
+    /// Chronological fit entries for `[summary_seg?, repository?, history…, reminder?, active_turn…, prompt?]`:
+    /// `<repository-context>` is head-anchored right after `[system, summary?]` so Turn N
+    /// remains a strict prefix extension of Turn N-1 when workspace docs are unchanged,
+    /// while `<system-reminder>` sits immediately before the active turn or new prompt.
+    fn place_entries(
+        &self,
+        segments: &[HistorySegment],
+        active_turn: Option<TurnId>,
+        prompt: Option<HistorySegment>,
+    ) -> Vec<FitEntry> {
+        let mut entries = Vec::with_capacity(segments.len() + 3);
+        let prior_start = if segments.first().is_some_and(|seg| seg.from_summary)
+            && (active_turn.is_none() || segments[0].turn_id != active_turn)
+        {
+            entries.push(FitEntry::history(segments[0].clone()));
+            1
+        } else {
+            0
+        };
         if let Some(message) = &self.repository {
             entries.push(FitEntry::volatile(
                 FitKind::Repository,
                 std::slice::from_ref(message),
             ));
+        }
+        let split = active_turn
+            .and_then(|turn| {
+                segments[prior_start..]
+                    .iter()
+                    .position(|seg| seg.turn_id == Some(turn))
+                    .map(|rel| prior_start + rel)
+            })
+            .unwrap_or(segments.len());
+        for seg in &segments[prior_start..split] {
+            entries.push(FitEntry::history(seg.clone()));
         }
         if let Some(message) = &self.reminder {
             entries.push(FitEntry::volatile(
@@ -349,12 +400,18 @@ impl VolatileTurnContext {
                 std::slice::from_ref(message),
             ));
         }
+        for seg in &segments[split..] {
+            entries.push(FitEntry::history(seg.clone()));
+        }
+        if let Some(prompt_seg) = prompt {
+            entries.push(FitEntry::prompt(prompt_seg));
+        }
         entries
     }
 
     /// The survivors of the two-phase fit: tails are slack-fillers and are
     /// admitted only as one ordered wire prefix (repository, then reminder),
-    /// so a reminder never survives without the repository tail in front of
+    /// so a reminder never survives without the repository block in front of
     /// it.
     fn filtered(&self, repository_kept: bool, reminder_kept: bool) -> Self {
         Self {
@@ -456,6 +513,7 @@ impl HistorySegment {
             from_summary: false,
             turn_id,
             tool_results: Vec::new(),
+            assistant_rounds: Vec::new(),
         }
     }
 
@@ -473,11 +531,23 @@ impl HistorySegment {
             from_summary: true,
             turn_id,
             tool_results: Vec::new(),
+            assistant_rounds: Vec::new(),
         }
     }
 
-    fn push_message(&mut self, message: Message) {
+    fn push_assistant_message(&mut self, message: Message, round_id: Option<String>) {
+        let idx = self.messages.len();
         self.messages.push(message);
+        self.assistant_rounds.push((idx, round_id));
+    }
+
+    fn insert_tool_message(&mut self, insert_idx: usize, message: Message) {
+        self.messages.insert(insert_idx, message);
+        for (assistant_idx, _) in &mut self.assistant_rounds {
+            if *assistant_idx >= insert_idx {
+                *assistant_idx += 1;
+            }
+        }
     }
 
     fn push_tool_result(&mut self, sequence: u64, tool_call_id: &str) {
@@ -607,6 +677,24 @@ impl SessionRuntimeService {
             .map_err(|error| SessionRuntimeError::ProviderConfiguration(error.to_string()))
     }
 
+    /// Durably updates the permission posture for an existing session and
+    /// returns the updated authoritative snapshot.
+    pub fn set_permission_mode_checked(
+        &self,
+        session_id: SessionId,
+        mode: latte_core::PermissionMode,
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
+        self.engine
+            .set_session_permission_mode_v2(session_id, mode)
+            .map_err(SessionRuntimeError::from)
+    }
+
+    /// Reads the active permission posture for `session_id`.
+    #[must_use]
+    pub fn permission_mode(&self, session_id: SessionId) -> latte_core::PermissionMode {
+        self.engine.session_permission_mode(session_id)
+    }
+
     /// Read-only projection of how full the next request window is for one
     /// durable session: exact bytes used/remaining against the resolved
     /// profile's request budget, token estimates for display, the segment
@@ -647,8 +735,7 @@ impl SessionRuntimeService {
         let bundle = context::build(&self.root, focus, policy.context_cap_bytes)
             .map_err(|error| SessionRuntimeError::History(error.to_string()))?;
         let volatile = Self::build_volatile_turn_context(&bundle, None);
-        let mut entries: Vec<FitEntry> = segments.iter().cloned().map(FitEntry::history).collect();
-        entries.extend(volatile.fit_entries());
+        let entries = volatile.place_entries(&segments, None, None);
         let fit = Self::fit_request(&system, &entries, budget)?;
         let discarded = segments.len() - fit.history_kept;
         let mut messages = Vec::with_capacity(fit.messages.len() + 1);
@@ -675,10 +762,13 @@ impl SessionRuntimeService {
         snapshot: SessionSnapshot,
         tier: latte_core::ManualCompactionTier,
     ) -> latte_core::ManualCompactionResult {
-        let revision = snapshot.revision;
+        let session_revision = snapshot.session_revision;
         latte_core::ManualCompactionResult {
             snapshot,
-            state: latte_core::ManualCompactionState::Compacted { tier, revision },
+            state: latte_core::ManualCompactionState::Compacted {
+                tier,
+                session_revision,
+            },
         }
     }
 
@@ -806,9 +896,24 @@ impl SessionRuntimeService {
         // Tier 2: model summary. There is no new prompt to fold in: when the
         // retain suffix is empty, the summary simply covers the boundary.
         let (retain_from, source) = Self::compaction_source(&fitting, boundary, compaction);
+        let (warm_prefix, repo_idx) = Self::assemble_request_with_repo_index(
+            &system,
+            None,
+            &fitting[..boundary],
+            &VolatileTurnContext {
+                repository: volatile.repository.clone(),
+                reminder: None,
+            },
+            None,
+        );
         // The lease is held across the summarizer and heartbeated inside.
         let summary = match self
-            .summarize_history(&snapshot, &source, Some(&lease))
+            .summarize_history(
+                &snapshot,
+                &source,
+                Some((&warm_prefix, repo_idx)),
+                Some(&lease),
+            )
             .await
         {
             Ok(Some(summary)) => summary,
@@ -994,7 +1099,7 @@ impl SessionRuntimeService {
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
         let runner = self.begin_runner(session_id)?;
         let snapshot = match self
-            .start_one(None, session_id, prompt, binding, focus, None)
+            .start_one(None, session_id, prompt, binding, focus, None, None)
             .await?
         {
             latte_core::CreateOutcome::Created(snapshot)
@@ -1021,6 +1126,25 @@ impl SessionRuntimeService {
             Result<latte_core::CreateOutcome<SessionSnapshot>, latte_core::CreateAcceptError>,
         >,
     ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, SessionRuntimeError> {
+        self.start_accepted_with_mode(session_id, command_id, prompt, binding, focus, None, accept)
+            .await
+    }
+
+    /// Like [`Self::start_accepted`], applying `permission_mode` atomically
+    /// only when a fresh session is durably created (`CreateOutcome::Created`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_accepted_with_mode(
+        &self,
+        session_id: SessionId,
+        command_id: SessionCommandId,
+        prompt: String,
+        binding: SessionProviderBinding,
+        focus: Option<&Path>,
+        permission_mode: Option<latte_core::PermissionMode>,
+        accept: oneshot::Sender<
+            Result<latte_core::CreateOutcome<SessionSnapshot>, latte_core::CreateAcceptError>,
+        >,
+    ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, SessionRuntimeError> {
         let runner = match self.begin_runner(session_id) {
             Ok(runner) => runner,
             Err(error) => {
@@ -1037,6 +1161,7 @@ impl SessionRuntimeService {
                 prompt,
                 binding,
                 focus,
+                permission_mode,
                 Some(accept),
             )
             .await?;
@@ -1066,18 +1191,21 @@ impl SessionRuntimeService {
         prompt: &str,
         binding: &SessionProviderBinding,
         focus: Option<&Path>,
+        permission_mode: Option<latte_core::PermissionMode>,
     ) -> Result<Option<SessionSnapshot>, SessionRuntimeError> {
         self.engine
-            .lookup_create_replay(
+            .lookup_create_replay_with_mode(
                 command_id,
                 session_id,
                 prompt,
                 binding,
                 focus.and_then(|focus| focus.to_str()),
+                permission_mode,
             )
             .map_err(SessionRuntimeError::from)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_one(
         &self,
         command_id: Option<SessionCommandId>,
@@ -1085,6 +1213,7 @@ impl SessionRuntimeService {
         prompt: String,
         binding: SessionProviderBinding,
         focus: Option<&Path>,
+        permission_mode: Option<latte_core::PermissionMode>,
         accept: Option<
             oneshot::Sender<
                 Result<latte_core::CreateOutcome<SessionSnapshot>, latte_core::CreateAcceptError>,
@@ -1111,7 +1240,14 @@ impl SessionRuntimeService {
         // acquiring the lease. A retry after a crash hits the record and
         // replays without blocking on the dead owner's still-unexpired lease.
         if let Some(command_id) = &command_id {
-            match self.durable_replay(command_id, session_id, &prompt, &binding, focus) {
+            match self.durable_replay(
+                command_id,
+                session_id,
+                &prompt,
+                &binding,
+                focus,
+                permission_mode,
+            ) {
                 Ok(Some(snapshot)) => {
                     signal_accept(
                         accept,
@@ -1143,12 +1279,13 @@ impl SessionRuntimeService {
         // never replay, but the create contract is uniform).
         let create_command_id =
             command_id.unwrap_or_else(|| SessionCommandId::from_uuid(Uuid::now_v7()));
-        let started = match self.engine.create_started_session_v2(
+        let started = match self.engine.create_started_session_v2_with_mode(
             &create_command_id,
             session_id,
             turn_id,
             binding,
             &prompt,
+            permission_mode,
             &lease,
             now,
             focus.and_then(|f| f.to_str()),
@@ -1217,7 +1354,7 @@ impl SessionRuntimeService {
         self.fail_retryable(
             started.session_id,
             turn_id,
-            started.revision,
+            started.session_revision,
             active_turn_revision(started)?,
             message,
             lease,
@@ -1245,6 +1382,7 @@ impl SessionRuntimeService {
                 prompt,
                 Some(command_id),
                 None,
+                None,
             )
             .await?
         {
@@ -1269,6 +1407,30 @@ impl SessionRuntimeService {
             Result<latte_core::CreateOutcome<SessionSnapshot>, latte_core::CreateAcceptError>,
         >,
     ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, SessionRuntimeError> {
+        self.follow_up_accepted_with_mode(
+            session_id,
+            command_id,
+            expected_session_revision,
+            prompt,
+            None,
+            accept,
+        )
+        .await
+    }
+
+    /// Like [`Self::follow_up_accepted`], applying `permission_mode` atomically
+    /// only when the follow-up turn is durably created (`CreateOutcome::Created`).
+    pub async fn follow_up_accepted_with_mode(
+        &self,
+        session_id: SessionId,
+        command_id: SessionCommandId,
+        expected_session_revision: u64,
+        prompt: String,
+        permission_mode: Option<latte_core::PermissionMode>,
+        accept: oneshot::Sender<
+            Result<latte_core::CreateOutcome<SessionSnapshot>, latte_core::CreateAcceptError>,
+        >,
+    ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, SessionRuntimeError> {
         let runner = match self.begin_runner_when_settled(session_id).await {
             Ok(runner) => runner,
             Err(error) => {
@@ -1282,6 +1444,7 @@ impl SessionRuntimeService {
                 expected_session_revision,
                 prompt,
                 Some(command_id),
+                permission_mode,
                 Some(accept),
             )
             .await?;
@@ -1307,6 +1470,7 @@ impl SessionRuntimeService {
         expected_session_revision: u64,
         prompt: String,
         command_id: Option<SessionCommandId>,
+        permission_mode: Option<latte_core::PermissionMode>,
         accept: Option<
             oneshot::Sender<
                 Result<latte_core::CreateOutcome<SessionSnapshot>, latte_core::CreateAcceptError>,
@@ -1326,11 +1490,12 @@ impl SessionRuntimeService {
         // still-unexpired lease, and without failing the revision fence (the
         // client's expected revision predates the accepted follow-up).
         if let Some(command_id) = &command_id {
-            match self.engine.lookup_follow_up_replay(
+            match self.engine.lookup_follow_up_replay_with_mode(
                 command_id,
                 session_id,
                 expected_session_revision,
                 &prompt,
+                permission_mode,
             ) {
                 Ok(Some(snapshot)) => {
                     signal_accept(
@@ -1347,7 +1512,8 @@ impl SessionRuntimeService {
                 }
             }
         }
-        if snapshot.revision != expected_session_revision || !snapshot.lifecycle.accepts_follow_up()
+        if snapshot.session_revision != expected_session_revision
+            || !snapshot.lifecycle.accepts_follow_up()
         {
             signal_accept(
                 accept,
@@ -1391,12 +1557,13 @@ impl SessionRuntimeService {
                 return Err(error);
             }
         };
-        let started = match self.engine.create_started_session_follow_up_v2(
+        let started = match self.engine.create_started_session_follow_up_v2_with_mode(
             command_id.as_ref(),
             session_id,
             turn_id,
             expected_session_revision,
             &prompt,
+            permission_mode,
             &lease,
             now_ms(),
         ) {
@@ -1456,7 +1623,7 @@ impl SessionRuntimeService {
                 .fail_retryable(
                     session_id,
                     turn_id,
-                    started.revision,
+                    started.session_revision,
                     active_turn_revision(&started)?,
                     provider_configuration_failure_message(),
                     &lease,
@@ -1656,9 +1823,10 @@ impl SessionRuntimeService {
                     snapshot = match self
                         .follow_up_one(
                             snapshot.session_id,
-                            snapshot.revision,
+                            snapshot.session_revision,
                             prompt,
                             Some(command_id),
+                            None,
                             None,
                         )
                         .await?
@@ -1715,7 +1883,7 @@ impl SessionRuntimeService {
         self.commit(
             snapshot.session_id,
             turn.turn_id,
-            snapshot.revision,
+            snapshot.session_revision,
             turn.turn_revision,
             CommitSessionTurnUpdate::AppendTranscript {
                 source_key: format!("{0}:queue-audit", turn.turn_id),
@@ -1765,7 +1933,7 @@ impl SessionRuntimeService {
             .validate()
             .map_err(SessionRuntimeError::ProviderConfiguration)?;
         let snapshot = self.load_full(session_id)?;
-        if snapshot.revision != expected_session_revision
+        if snapshot.session_revision != expected_session_revision
             || !snapshot.lifecycle.accepts_follow_up()
             || snapshot.active_turn_id.is_some()
         {
@@ -1805,7 +1973,7 @@ impl SessionRuntimeService {
             .find(|turn| turn.turn_id == turn_id)
             .ok_or(SessionRuntimeError::InvalidState)?;
         if snapshot.lifecycle != SessionLifecycle::WaitingInput
-            || snapshot.revision != expected_session_revision
+            || snapshot.session_revision != expected_session_revision
             || turn.turn_revision != expected_turn_revision
         {
             return Err(SessionRuntimeError::InvalidState);
@@ -1841,7 +2009,7 @@ impl SessionRuntimeService {
         };
         let provider = (self.provider)(&snapshot.binding)
             .map_err(SessionRuntimeError::ProviderConfiguration)?;
-        let lease = self.acquire(session_id)?;
+        let lease = self.acquire_parked_async(session_id).await?;
         // Adopt-or-create the queue intake under the lease (issue #22): the
         // prompts queued while this turn was parked survive the resume and
         // run when this turn's own drain reaches them.
@@ -1849,7 +2017,7 @@ impl SessionRuntimeService {
         let running = match self.commit(
             session_id,
             turn_id,
-            snapshot.revision,
+            snapshot.session_revision,
             turn.turn_revision,
             CommitSessionTurnUpdate::ProvideInput {
                 source_key: format!("{turn_id}:input:{request_id}"),
@@ -1888,9 +2056,14 @@ impl SessionRuntimeService {
                 return Err(error);
             }
         };
-        let done = match self
-            .run_provider_turn(running, messages, volatile, provider.provider, lease)
-            .await
+        let done = match Box::pin(self.run_provider_turn(
+            running,
+            messages,
+            volatile,
+            provider.provider,
+            lease,
+        ))
+        .await
         {
             Ok(done) => done,
             Err(error) => {
@@ -1898,22 +2071,7 @@ impl SessionRuntimeService {
                 return Err(error);
             }
         };
-        // The guard MUST reach drain open (same contract as
-        // `resolve_permission`): every `?` escape inside drain then reclaims
-        // the mailbox entry via `Drop`, so a mid-drain failure (e.g. the
-        // follow-up revision/lease races) leaves the session reusable.
-        // Marking it closed here would leak the entry instead — and a leaked
-        // entry fails `begin_runner` forever, permanently locking the
-        // session behind `InvalidState` with no in-process recovery.
-        //
-        // Coverage note: this call site is NOT covered by automation — the
-        // escape window between the turn's lease release and the queued
-        // follow-up's own acquire is race-only and cannot be reached
-        // deterministically through `provide_input` (provider failures are
-        // swallowed by `fail_retryable`, never `?`). The drain ownership
-        // tests pin the contract at the drain unit; this open-guard handoff
-        // is review-enforced.
-        self.drain_mailbox(done, runner).await
+        Box::pin(self.drain_mailbox(done, runner)).await
     }
 
     /// Resolves a durable v2 effect permission. Allow consumes the exact
@@ -1935,7 +2093,7 @@ impl SessionRuntimeService {
             .ok_or(SessionRuntimeError::InvalidState)?;
         let turn_revision = active_turn_revision(&snapshot)?;
         if snapshot.lifecycle != SessionLifecycle::WaitingPermission
-            || snapshot.revision != expected_session_revision
+            || snapshot.session_revision != expected_session_revision
             || turn_revision != expected_turn_revision
             || snapshot.pending.as_ref().and_then(|pending| match pending {
                 latte_core::SessionPendingRequest::Permission { request_id, .. } => {
@@ -1946,7 +2104,13 @@ impl SessionRuntimeService {
         {
             return Err(SessionRuntimeError::InvalidState);
         }
-        let verification = is_verification_effect_id(&request_id);
+        let effect_id =
+            EffectId::new(request_id.clone()).map_err(|_| SessionRuntimeError::InvalidState)?;
+        let verification = effect_id.is_verification();
+        let expected_round_id = match effect_id.parse_session() {
+            Some(SessionEffectKind::ToolCall { round_id, .. }) => Some(round_id),
+            _ => None,
+        };
         // Validate the immutable Provider binding before approval can start an
         // external effect. A configuration/model mismatch is not authority to
         // consume permission or execute the tool; the Session remains at the
@@ -1959,7 +2123,7 @@ impl SessionRuntimeService {
         } else {
             None
         };
-        let lease = self.acquire(session_id)?;
+        let lease = self.acquire_parked_async(session_id).await?;
         // Adopt-or-create the queue intake under the lease (issue #22), the
         // same contract as provide_input.
         let mut runner = self.ensure_runner(session_id);
@@ -1967,12 +2131,15 @@ impl SessionRuntimeService {
             let resolved = self.engine.resolve_session_effect_permission(
                 session_id,
                 turn_id,
-                snapshot.revision,
+                snapshot.session_revision,
                 turn_revision,
                 request_id.clone(),
-                format!(
-                    "{turn_id}:permission:{request_id}:{}",
-                    if allow { "allow" } else { "deny" }
+                bounded_source_key(
+                    "permission-resolve",
+                    format!(
+                        "{turn_id}:permission:{request_id}:{}",
+                        if allow { "allow" } else { "deny" }
+                    ),
                 ),
                 allow,
                 SessionCommandId::from_uuid(Uuid::now_v7()),
@@ -1993,28 +2160,31 @@ impl SessionRuntimeService {
             let started = self.engine.start_session_effect(
                 session_effect_start_request(
                     &resolved,
-                    request_id.clone(),
-                    format!("{turn_id}:effect:{request_id}:start"),
+                    effect_id,
+                    bounded_source_key(
+                        "effect-start",
+                        format!("{turn_id}:effect:{request_id}:start"),
+                    ),
                 )?,
                 self.engine.session_effect_digest(&request_id)?,
                 &lease,
                 now_ms(),
             )?;
-            let presentation = started.presentation.clone();
+            let view = started.view.clone();
             // The assistant card is the durable, ordered queue for the complete
-            // provider tool round. The presentation is redacted, but its call ID
-            // is enough to find that queue; executable input remains engine-only.
+            // provider tool round. The view is redacted, but its call ID + round ID
+            // are enough to find that queue; executable input remains engine-only.
             let continuation = (!verification)
-                .then(|| tool_round_for_call(&resolved, &presentation.tool_call_id))
+                .then(|| tool_round_for_call(&resolved, expected_round_id, &view.tool_call_id))
                 .transpose()?;
             let after_effect = self.execute_and_observe_effect(started, &lease).await?;
             if after_effect.lifecycle != SessionLifecycle::Running {
                 return Ok(after_effect);
             }
             if verification {
-                return self.finish_verification(&after_effect, &presentation, &lease);
+                return self.finish_verification(&after_effect, &view, &lease);
             }
-            let (round_sequence, calls, ordinal) = continuation.ok_or_else(|| {
+            let position = continuation.ok_or_else(|| {
                 SessionRuntimeError::Effect("provider tool continuation is missing".into())
             })?;
             let provider = provider.ok_or_else(|| {
@@ -2041,8 +2211,18 @@ impl SessionRuntimeService {
                 .active_turn_id
                 .ok_or(SessionRuntimeError::InvalidState)?;
             let segments = Self::scan_history_segments(&after_effect);
-            let messages =
-                Self::assemble_mid_turn_request(&head, None, &segments, active_turn, &volatile);
+            let budget = profile.history_policy().budget()?;
+            let fit_entries = volatile.place_entries(&segments, Some(active_turn), None);
+            let fit = Self::fit_request(&head, &fit_entries, budget)?;
+            let volatile = volatile.filtered(fit.repository_kept, fit.reminder_kept);
+            let kept_start = segments.len().saturating_sub(fit.history_kept);
+            let messages = Self::assemble_mid_turn_request(
+                &head,
+                None,
+                &segments[kept_start..],
+                active_turn,
+                &volatile,
+            );
             // Finish the remaining calls of this approved batch, then re-enter the
             // iterative turn loop. The loop re-reads the persisted round counter
             // itself, so approval/restart resumptions never reset the budget.
@@ -2050,23 +2230,28 @@ impl SessionRuntimeService {
                 .execute_tool_batch(
                     after_effect,
                     messages,
-                    calls,
-                    ordinal.saturating_add(1),
-                    round_sequence,
+                    position.round,
+                    position.call_ordinal.saturating_add(1),
                     &lease,
                 )
                 .await?;
             match outcome {
                 ToolBatchOutcome::Parked(parked) => Ok(parked),
                 ToolBatchOutcome::Completed { snapshot, messages } => {
-                    self.run_provider_turn(snapshot, messages, volatile, provider.provider, lease)
-                        .await
+                    Box::pin(self.run_provider_turn(
+                        snapshot,
+                        messages,
+                        volatile,
+                        provider.provider,
+                        lease,
+                    ))
+                    .await
                 }
             }
         }
         .await;
         match resumed {
-            Ok(snapshot) => self.drain_mailbox(snapshot, runner).await,
+            Ok(snapshot) => Box::pin(self.drain_mailbox(snapshot, runner)).await,
             Err(error) => {
                 // Keep the queue intake: the durable session state owns the
                 // truth about this turn, and a parked queue must survive a
@@ -2083,6 +2268,7 @@ impl SessionRuntimeService {
         session_id: SessionId,
         effect_id: &str,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
+        let effect_id = EffectId::new(effect_id).map_err(SessionRuntimeError::Effect)?;
         let snapshot = self.load_full(session_id)?;
         let turn_id = snapshot
             .latest_turn_id
@@ -2101,15 +2287,19 @@ impl SessionRuntimeService {
         // sub-second turn TTL) to avoid a spurious `LeaseLost` if the acquire →
         // in-transaction recheck window stalls under load.
         let lease = self.acquire_with_ttl(session_id, self.management_ttl())?;
+        let reconcile_source = bounded_source_key(
+            "effect-reconcile",
+            format!("{turn_id}:effect:{effect_id}:reconcile"),
+        );
         let terminal = self
             .engine
             .reconcile_session_effect_unknown(
                 session_id,
                 turn_id,
-                snapshot.revision,
+                snapshot.session_revision,
                 turn_revision,
-                effect_id.to_owned(),
-                format!("{turn_id}:effect:{effect_id}:reconcile"),
+                effect_id,
+                reconcile_source,
                 SessionCommandId::from_uuid(Uuid::now_v7()),
                 &lease,
                 now_ms(),
@@ -2167,7 +2357,8 @@ impl SessionRuntimeService {
             .turn_revision;
         // Fence the caller's expectation against the authoritative snapshot
         // before signalling or committing any cancellation.
-        if snapshot.revision != expected_session_revision || turn_revision != expected_turn_revision
+        if snapshot.session_revision != expected_session_revision
+            || turn_revision != expected_turn_revision
         {
             return Err(SessionRuntimeError::InvalidState);
         }
@@ -2182,11 +2373,11 @@ impl SessionRuntimeService {
                 return self.load_full(session_id);
             }
         }
-        let lease = self.acquire(session_id)?;
+        let lease = self.acquire_parked(session_id)?;
         let snapshot = self.commit(
             session_id,
             turn_id,
-            snapshot.revision,
+            snapshot.session_revision,
             turn_revision,
             CommitSessionTurnUpdate::Interrupt {
                 source_key: format!("{turn_id}:cancel"),
@@ -2266,8 +2457,8 @@ impl SessionRuntimeService {
         let policy = profile.history_policy();
         let volatile = Self::build_volatile_turn_context(bundle, reminder);
         let head = Self::build_system_head(profile)?;
-        let mut entries = volatile.fit_entries();
-        entries.push(FitEntry::prompt(Self::prospective_prompt_segment(prompt)));
+        let entries =
+            volatile.place_entries(&[], None, Some(Self::prospective_prompt_segment(prompt)));
         let fit = Self::fit_request(&head, &entries, policy.budget()?)?;
         if !fit.prompt_kept {
             return Err(SessionRuntimeError::History(
@@ -2379,7 +2570,7 @@ impl SessionRuntimeService {
         self.commit(
             session_id,
             turn_id,
-            snapshot.revision,
+            snapshot.session_revision,
             turn_revision,
             update,
             lease,
@@ -2423,9 +2614,11 @@ impl SessionRuntimeService {
         // current prompt. The mandatory core takes the full budget first;
         // the tails only fill the slack, so the request assembled below is
         // exactly the fitted set and can never exceed the byte budget.
-        let mut entries: Vec<FitEntry> = history.iter().cloned().map(FitEntry::history).collect();
-        entries.extend(volatile.fit_entries());
-        entries.push(FitEntry::prompt(Self::prospective_prompt_segment(prompt)));
+        let entries = volatile.place_entries(
+            &history,
+            None,
+            Some(Self::prospective_prompt_segment(prompt)),
+        );
         let fit = Self::fit_request(&system, &entries, budget)?;
         // The prompt is non-discardable; failing to fit it fails closed
         // rather than issuing a request without the user's words.
@@ -2528,15 +2721,11 @@ impl SessionRuntimeService {
         let cured = if reactive {
             // Re-cure is measured over the REAL shape, volatile tails and
             // prompt included: every history segment must fit.
-            let mut cured_entries: Vec<FitEntry> = elided_segments
-                .iter()
-                .cloned()
-                .map(FitEntry::history)
-                .collect();
-            cured_entries.extend(env.volatile.fit_entries());
-            cured_entries.push(FitEntry::prompt(Self::prospective_prompt_segment(
-                env.prompt,
-            )));
+            let cured_entries = env.volatile.place_entries(
+                &elided_segments,
+                None,
+                Some(Self::prospective_prompt_segment(env.prompt)),
+            );
             let cured_fit = Self::fit_request(env.system, &cured_entries, env.budget)?;
             cured_fit.prompt_kept && cured_fit.history_kept == elided_segments.len()
         } else {
@@ -2600,9 +2789,22 @@ impl SessionRuntimeService {
                 compaction.max_summary_source_bytes,
             );
         }
+        let (warm_prefix, repo_idx) = Self::assemble_request_with_repo_index(
+            env.system,
+            None,
+            &fitting[..boundary],
+            &VolatileTurnContext {
+                repository: env.volatile.repository.clone(),
+                reminder: None,
+            },
+            retain_from.is_none().then_some(env.prompt_message),
+        );
         // Pre-turn preparation holds no lease yet, so the summarizer runs
         // without a lease heartbeat; provider-side failures degrade.
-        let summary = match self.summarize_history(snapshot, &source, None).await {
+        let summary = match self
+            .summarize_history(snapshot, &source, Some((&warm_prefix, repo_idx)), None)
+            .await
+        {
             Ok(Some(summary)) => summary,
             Ok(None) => {
                 self.note_compaction_failure(snapshot.session_id);
@@ -2805,10 +3007,12 @@ impl SessionRuntimeService {
     /// longer than the lease TTL) cancels the request and returns `Err` so a
     /// late success cannot be silently dropped at append time. `lease` is
     /// `None` only for pre-turn preparation, which runs before acquisition.
+    #[allow(clippy::too_many_lines)]
     async fn summarize_history(
         &self,
         snapshot: &SessionSnapshot,
         source_text: &str,
+        warm_prefix: Option<(&[Message], Option<usize>)>,
         lease: Option<&SessionLeaseGuard>,
     ) -> Result<Option<String>, SessionRuntimeError> {
         let Ok(profile) = self.resolved_profile(&snapshot.binding) else {
@@ -2819,6 +3023,61 @@ impl SessionRuntimeService {
         };
         let Ok(provider) = (self.provider)(&snapshot.binding) else {
             return Ok(None);
+        };
+        let budget = profile.history_policy().budget().unwrap_or(0);
+        let max_source_bytes = profile.compaction().max_summary_source_bytes;
+        let (messages, tools) = if profile.compaction().reuse_prefix
+            && let Some((prefix, repo_context_idx)) = warm_prefix.filter(|(p, _)| !p.is_empty())
+        {
+            let history_slice: Vec<Message> = prefix
+                .iter()
+                .enumerate()
+                .filter(|(idx, msg)| {
+                    if *idx == 0 && matches!(msg, Message::System { .. }) {
+                        return false;
+                    }
+                    if repo_context_idx == Some(*idx) {
+                        return false;
+                    }
+                    true
+                })
+                .map(|(_, msg)| msg.clone())
+                .collect();
+            let within_source_cap =
+                wire_bytes(&history_slice).is_ok_and(|bytes| bytes <= max_source_bytes);
+            let mut candidate = prefix.to_vec();
+            candidate.push(Message::User {
+                content: format!(
+                    "{instructions}\n[Summarize the conversation turns above according to these instructions.]"
+                ),
+            });
+            if within_source_cap && wire_bytes(&candidate).is_ok_and(|bytes| bytes <= budget) {
+                (candidate, self.engine.tool_descriptors())
+            } else {
+                (
+                    vec![
+                        Message::System {
+                            content: instructions,
+                        },
+                        Message::User {
+                            content: source_text.to_owned(),
+                        },
+                    ],
+                    Vec::new(),
+                )
+            }
+        } else {
+            (
+                vec![
+                    Message::System {
+                        content: instructions,
+                    },
+                    Message::User {
+                        content: source_text.to_owned(),
+                    },
+                ],
+                Vec::new(),
+            )
         };
         let cancellation = CancellationToken::new();
         // Reuses the per-session active-cancellation slot: preparation is
@@ -2832,15 +3091,8 @@ impl SessionRuntimeService {
             .insert(snapshot.session_id, cancellation.clone());
         let output = provider.provider.complete(
             ProviderRequest {
-                messages: vec![
-                    Message::System {
-                        content: instructions,
-                    },
-                    Message::User {
-                        content: source_text.to_owned(),
-                    },
-                ],
-                tools: Vec::new(),
+                messages,
+                tools,
                 session_ref: crate::provider::session_ref_for(snapshot.session_id),
             },
             ProviderContext {
@@ -3025,6 +3277,162 @@ impl SessionRuntimeService {
     /// provider-grammar rules shared by every scan path. Compact-summary and
     /// tool-result-elision cards are handled by
     /// [`Self::scan_history_segments`] directly and never reach this fold.
+    #[allow(clippy::too_many_lines)]
+    fn apply_tool_result_entry(
+        segments: &mut [HistorySegment],
+        entry: &latte_core::TranscriptEntry,
+        elided: &std::collections::HashSet<u64>,
+    ) {
+        let Some(payload) = entry.payload.as_ref() else {
+            return;
+        };
+        let (Some(tool_call_id), Some(original)) = (
+            payload
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str),
+            payload
+                .get("provider_content")
+                .and_then(serde_json::Value::as_str),
+        ) else {
+            return;
+        };
+        let result_round_id: Option<String> = payload
+            .get("round_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                let raw = payload
+                    .get("effect_id")
+                    .and_then(serde_json::Value::as_str)?;
+                let parsed = EffectId::new(raw).ok()?.parse_session()?;
+                match parsed {
+                    SessionEffectKind::ToolCall { round_id, .. } => Some(round_id.to_string()),
+                    SessionEffectKind::Verification { .. } => None,
+                }
+            });
+        // A `tool` message is only legal as the answer to a call the assistant
+        // actually made. Repaired `ToolResult` cards are appended at tail
+        // sequence after later turns or final assistant cards, so route by
+        // `entry.turn_id` + assistant `round_id` + declared `tool_call_id` into
+        // the exact assistant round rather than deduplicating across the whole turn.
+        let last_idx = segments.len().checked_sub(1);
+        let Some((seg_idx, segment)) = segments.iter_mut().enumerate().rev().find(|(_, seg)| {
+            !seg.from_summary
+                && (entry.turn_id.is_none() || seg.turn_id == entry.turn_id)
+                && declared_tool_call(&seg.messages, tool_call_id)
+        }) else {
+            return;
+        };
+        let round_bounds = |messages: &[Message], assistant_idx: usize| -> usize {
+            let mut end = assistant_idx + 1;
+            while matches!(messages.get(end), Some(Message::Tool { .. })) {
+                end += 1;
+            }
+            end
+        };
+        let round_has_result = |messages: &[Message], assistant_idx: usize, end: usize| -> bool {
+            messages[assistant_idx + 1..end].iter().any(|msg| {
+                matches!(
+                    msg,
+                    Message::Tool {
+                        tool_call_id: existing,
+                        ..
+                    } if existing == tool_call_id
+                )
+            })
+        };
+        let matched_by_round_id = result_round_id.as_deref().and_then(|target_rid| {
+            segment
+                .assistant_rounds
+                .iter()
+                .rev()
+                .find_map(|(assistant_idx, declared_rid)| {
+                    if declared_rid.as_deref() != Some(target_rid) {
+                        return None;
+                    }
+                    let Message::Assistant { tool_calls, .. } =
+                        segment.messages.get(*assistant_idx)?
+                    else {
+                        return None;
+                    };
+                    let call_pos = tool_calls.iter().position(|call| call.id == tool_call_id)?;
+                    Some((*assistant_idx, tool_calls.clone(), call_pos))
+                })
+        });
+        let matched_round = matched_by_round_id.or_else(|| {
+            // Without an explicit round_id match, prefer the latest assistant
+            // round that declared `tool_call_id` and does not yet have a result
+            // for it; fall back to the latest round declaring `tool_call_id` so
+            // within-round duplicates are cleanly dropped below.
+            let mut fallback = None;
+            for (assistant_idx, _) in segment.assistant_rounds.iter().rev() {
+                let Some(Message::Assistant { tool_calls, .. }) =
+                    segment.messages.get(*assistant_idx)
+                else {
+                    continue;
+                };
+                let Some(call_pos) = tool_calls.iter().position(|call| call.id == tool_call_id)
+                else {
+                    continue;
+                };
+                let end = round_bounds(&segment.messages, *assistant_idx);
+                if !round_has_result(&segment.messages, *assistant_idx, end) {
+                    return Some((*assistant_idx, tool_calls.clone(), call_pos));
+                }
+                if fallback.is_none() {
+                    fallback = Some((*assistant_idx, tool_calls.clone(), call_pos));
+                }
+            }
+            fallback
+        });
+        let Some((assistant_idx, calls, call_pos)) = matched_round else {
+            return;
+        };
+        let round_end = round_bounds(&segment.messages, assistant_idx);
+        if round_has_result(&segment.messages, assistant_idx, round_end) {
+            return;
+        }
+        let name = payload.get("name").and_then(serde_json::Value::as_str);
+        let content = if elided.contains(&entry.sequence) {
+            Self::elided_tool_skeleton(name, original, payload)
+        } else {
+            original.to_owned()
+        };
+        let mut insert_idx = assistant_idx + 1;
+        while insert_idx < round_end {
+            let Some(Message::Tool {
+                tool_call_id: existing_id,
+                ..
+            }) = segment.messages.get(insert_idx)
+            else {
+                break;
+            };
+            let existing_pos = calls
+                .iter()
+                .position(|call| call.id == *existing_id)
+                .unwrap_or(usize::MAX);
+            if existing_pos > call_pos {
+                break;
+            }
+            insert_idx += 1;
+        }
+        segment.insert_tool_message(
+            insert_idx,
+            Message::Tool {
+                tool_call_id: tool_call_id.into(),
+                name: name.map(str::to_owned),
+                content: content.clone(),
+            },
+        );
+        let seq_for_bounds = if Some(seg_idx) == last_idx {
+            entry.sequence
+        } else {
+            segment.max_sequence.unwrap_or(entry.sequence)
+        };
+        segment.push_tool_result(entry.sequence, tool_call_id);
+        segment.push_text(&format!("[tool]\n{content}\n"), seq_for_bounds);
+    }
+
     fn apply_entry(
         segments: &mut Vec<HistorySegment>,
         entry: &latte_core::TranscriptEntry,
@@ -3047,47 +3455,44 @@ impl SessionRuntimeService {
                         .and_then(|payload| payload.get("tool_calls"))
                         .and_then(|calls| serde_json::from_value(calls.clone()).ok())
                         .unwrap_or_default();
-                    segment.push_message(Message::Assistant {
-                        content: Some(entry.text.clone()),
-                        tool_calls,
-                    });
+                    let content_absent = entry
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("content_absent"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let reasoning_content = entry
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("reasoning_content"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    let thinking_blocks = entry
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("thinking_blocks"))
+                        .and_then(|blocks| serde_json::from_value(blocks.clone()).ok())
+                        .unwrap_or_default();
+                    let round_id = entry
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("round_id"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    segment.push_assistant_message(
+                        Message::Assistant {
+                            content: (!content_absent).then(|| entry.text.clone()),
+                            reasoning_content,
+                            thinking_blocks,
+                            tool_calls,
+                        },
+                        round_id,
+                    );
                     segment.push_text(&format!("[assistant]\n{}\n", entry.text), entry.sequence);
                 }
             }
             TranscriptKind::ToolResult => {
-                if let Some(segment) = segments.last_mut()
-                        && let Some(payload) = entry.payload.as_ref()
-                        && let (Some(tool_call_id), Some(original)) = (
-                            payload
-                                .get("tool_call_id")
-                                .and_then(serde_json::Value::as_str),
-                            payload
-                                .get("provider_content")
-                                .and_then(serde_json::Value::as_str),
-                        )
-                        // A `tool` message is only legal as the answer to a
-                        // call the assistant actually made. Engine-initiated
-                        // effects — verification above all — are recorded as
-                        // tool results with an id we minted, which the model
-                        // never declared; replaying one makes every later turn
-                        // of the Session a protocol violation the Provider
-                        // rejects outright.
-                        && declared_tool_call(&segment.messages, tool_call_id)
-                {
-                    let name = payload.get("name").and_then(serde_json::Value::as_str);
-                    let content = if elided.contains(&entry.sequence) {
-                        Self::elided_tool_skeleton(name, original, payload)
-                    } else {
-                        original.to_owned()
-                    };
-                    segment.push_message(Message::Tool {
-                        tool_call_id: tool_call_id.into(),
-                        name: name.map(str::to_owned),
-                        content: content.clone(),
-                    });
-                    segment.push_tool_result(entry.sequence, tool_call_id);
-                    segment.push_text(&format!("[tool]\n{content}\n"), entry.sequence);
-                }
+                Self::apply_tool_result_entry(segments, entry, elided);
             }
             TranscriptKind::Failure
                 if entry.payload.as_ref().is_some_and(|payload| {
@@ -3334,9 +3739,10 @@ impl SessionRuntimeService {
         })
     }
 
-    /// Assembles a full request with the non-persistent volatile block and
-    /// the current prompt after durable history (and an optional summary):
-    /// `[head, summary?, history…, repository?, reminder?, prompt?]`.
+    /// Assembles a full request with `<repository-context>` head-anchored
+    /// directly under `[system, summary?]` and `<system-reminder>` immediately
+    /// ahead of the new prompt:
+    /// `[head, summary?, repository?, history…, reminder?, prompt?]`.
     fn assemble_request(
         system: &Message,
         summary: Option<&str>,
@@ -3344,28 +3750,52 @@ impl SessionRuntimeService {
         volatile: &VolatileTurnContext,
         prompt: Option<&Message>,
     ) -> Vec<Message> {
+        Self::assemble_request_with_repo_index(system, summary, history, volatile, prompt).0
+    }
+
+    fn assemble_request_with_repo_index(
+        system: &Message,
+        summary: Option<&str>,
+        history: &[HistorySegment],
+        volatile: &VolatileTurnContext,
+        prompt: Option<&Message>,
+    ) -> (Vec<Message>, Option<usize>) {
         let mut messages = vec![system.clone()];
-        if let Some(summary) = summary {
+        let prior_start = if let Some(summary) = summary {
             messages.push(Message::User {
                 content: format!(
                     "Earlier conversation, automatically compacted to this summary:\n\n{summary}"
                 ),
             });
-        }
-        for segment in history {
+            0
+        } else if history.first().is_some_and(|seg| seg.from_summary) {
+            messages.extend(history[0].messages.iter().cloned());
+            1
+        } else {
+            0
+        };
+        let repo_idx = if let Some(repository) = &volatile.repository {
+            let idx = messages.len();
+            messages.push(repository.clone());
+            Some(idx)
+        } else {
+            None
+        };
+        for segment in &history[prior_start..] {
             messages.extend(segment.messages.iter().cloned());
         }
-        messages.extend(volatile.messages());
+        if let Some(reminder) = &volatile.reminder {
+            messages.push(reminder.clone());
+        }
         if let Some(prompt) = prompt {
             messages.push(prompt.clone());
         }
-        messages
+        (messages, repo_idx)
     }
 
-    /// Re-inserts the per-turn volatile block immediately before the open
-    /// (active) turn's first segment after a mid-turn rebuild. Completed
-    /// history precedes the block; the open turn (its prompt, assistant
-    /// batches, tool results) follows it verbatim.
+    /// Re-inserts `<repository-context>` directly under `[system, summary?]`
+    /// and `<system-reminder>` immediately before the open (active) turn's
+    /// first segment after a mid-turn rebuild.
     fn assemble_mid_turn_request(
         system: &Message,
         summary: Option<&str>,
@@ -3373,22 +3803,35 @@ impl SessionRuntimeService {
         active_turn: TurnId,
         volatile: &VolatileTurnContext,
     ) -> Vec<Message> {
-        let split = segments
-            .iter()
-            .position(|segment| segment.turn_id == Some(active_turn))
-            .unwrap_or(segments.len());
         let mut messages = vec![system.clone()];
-        if let Some(summary) = summary {
+        let prior_start = if let Some(summary) = summary {
             messages.push(Message::User {
                 content: format!(
                     "Earlier conversation, automatically compacted to this summary:\n\n{summary}"
                 ),
             });
+            0
+        } else if segments.first().is_some_and(|seg| seg.from_summary)
+            && segments[0].turn_id != Some(active_turn)
+        {
+            messages.extend(segments[0].messages.iter().cloned());
+            1
+        } else {
+            0
+        };
+        let split = segments[prior_start..]
+            .iter()
+            .position(|segment| segment.turn_id == Some(active_turn))
+            .map_or(segments.len(), |rel| prior_start + rel);
+        if let Some(repository) = &volatile.repository {
+            messages.push(repository.clone());
         }
-        for segment in &segments[..split] {
+        for segment in &segments[prior_start..split] {
             messages.extend(segment.messages.iter().cloned());
         }
-        messages.extend(volatile.messages());
+        if let Some(reminder) = &volatile.reminder {
+            messages.push(reminder.clone());
+        }
         for segment in &segments[split..] {
             messages.extend(segment.messages.iter().cloned());
         }
@@ -3427,7 +3870,7 @@ impl SessionRuntimeService {
         &self,
         snapshot: &SessionSnapshot,
         summary: &str,
-    ) -> Result<SessionEffectDescriptor, SessionRuntimeError> {
+    ) -> Result<EffectAuthority, SessionRuntimeError> {
         let plan = self.verification.as_ref().ok_or_else(|| {
             SessionRuntimeError::Effect(
                 "workspace changed but no configured verification plan is available".into(),
@@ -3441,8 +3884,8 @@ impl SessionRuntimeService {
         let turn_id = snapshot
             .active_turn_id
             .ok_or(SessionRuntimeError::InvalidState)?;
-        Ok(SessionEffectDescriptor {
-            effect_id: format!("{SESSION_VERIFICATION_EFFECT_PREFIX}{turn_id}"),
+        Ok(EffectAuthority {
+            effect_id: EffectId::for_verification(turn_id),
             tool_call_id: format!("verification-{turn_id}"),
             name: "process".into(),
             input: serde_json::json!({
@@ -3472,11 +3915,11 @@ impl SessionRuntimeService {
         let turn_id = snapshot
             .active_turn_id
             .ok_or(SessionRuntimeError::InvalidState)?;
-        let descriptor = self.verification_descriptor(&snapshot, &summary)?;
+        let authority = self.verification_descriptor(&snapshot, &summary)?;
         let prepared = self.engine.prepare_session_effect(
             session_effect_request(
                 &snapshot,
-                descriptor.clone(),
+                authority.clone(),
                 format!("{turn_id}:verification:prepare"),
             )?,
             lease,
@@ -3488,35 +3931,34 @@ impl SessionRuntimeService {
         let started = self.engine.start_session_effect(
             session_effect_start_request(
                 &prepared.snapshot,
-                descriptor.effect_id.clone(),
+                authority.effect_id,
                 format!("{turn_id}:verification:start"),
             )?,
             prepared.operation_digest,
             lease,
             now_ms(),
         )?;
-        let presentation = started.presentation.clone();
+        let view = started.view.clone();
         let observed = self.execute_and_observe_effect(started, lease).await?;
         if observed.lifecycle != SessionLifecycle::Running {
             return Ok(observed);
         }
-        self.finish_verification(&observed, &presentation, lease)
+        self.finish_verification(&observed, &view, lease)
     }
 
     fn finish_verification(
         &self,
         snapshot: &SessionSnapshot,
-        descriptor: &SessionEffectPresentation,
+        view: &EffectView,
         lease: &Lease,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
         let turn_id = snapshot
             .active_turn_id
             .ok_or(SessionRuntimeError::InvalidState)?;
         let turn_revision = active_turn_revision(snapshot)?;
-        let raw_output =
-            effect_provider_result(snapshot, &descriptor.tool_call_id).ok_or_else(|| {
-                SessionRuntimeError::Effect("verification observation is missing".into())
-            })?;
+        let raw_output = effect_provider_result(snapshot, &view.tool_call_id).ok_or_else(|| {
+            SessionRuntimeError::Effect("verification observation is missing".into())
+        })?;
         let output: latte_engine::ProcessOutput =
             serde_json::from_str(&raw_output).map_err(|_| {
                 SessionRuntimeError::Effect(
@@ -3526,22 +3968,38 @@ impl SessionRuntimeService {
         self.engine.record_session_verification(
             turn_id,
             turn_revision,
-            &descriptor.effect_id,
+            &view.effect_id,
             &output,
             lease,
             now_ms(),
         )?;
         if !output.command_succeeded() {
-            return self.fail(
+            let detail = if output.stderr.trim().is_empty() {
+                output.stdout.trim()
+            } else {
+                output.stderr.trim()
+            };
+            let snippet = if detail.is_empty() {
+                String::new()
+            } else {
+                let mut cut = detail.len().min(512);
+                while !detail.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                format!(" ({})", &detail[..cut])
+            };
+            return self.fail_with_code(
                 snapshot.session_id,
                 turn_id,
-                snapshot.revision,
+                snapshot.session_revision,
                 turn_revision,
-                "configured verification failed; evidence was recorded".into(),
+                FailureCode::VerificationFailed,
+                &format!("configured verification failed; evidence was recorded{snippet}"),
+                Retryability::Retryable,
                 lease,
             );
         }
-        let summary = descriptor
+        let summary = view
             .input
             .get("completion_summary")
             .and_then(serde_json::Value::as_str)
@@ -3550,13 +4008,7 @@ impl SessionRuntimeService {
             })?
             .to_owned();
         self.engine
-            .complete_session_verified(
-                snapshot,
-                summary,
-                descriptor.effect_id.clone(),
-                lease,
-                now_ms(),
-            )
+            .complete_session_verified(snapshot, summary, view.effect_id.clone(), lease, now_ms())
             .map_err(Into::into)
     }
 
@@ -3591,44 +4043,66 @@ impl SessionRuntimeService {
             let failed = self.fail(
                 session_id,
                 turn_id,
-                snapshot.revision,
+                snapshot.session_revision,
                 turn_revision,
                 "provider tool call ids must match [A-Za-z0-9_-]{1,256}, be unique, known, and object-shaped".into(),
                 lease,
             )?;
             return Ok(ToolBatchOutcome::Parked(failed));
         }
+        let content_absent = response.message.is_none();
+        let reasoning_content = response.reasoning_content().map(redact_session_text);
+        let raw_thinking_blocks = response.thinking_blocks();
+        let redacted_thinking_blocks = redact_thinking_blocks(&raw_thinking_blocks);
         let assistant_text = response.message.clone().unwrap_or_default();
         let first_tool_call_id = response.tool_calls[0].id.clone();
         let tool_calls = response.tool_calls;
+        let round_id = RoundId::from_u64(snapshot.sequence.saturating_add(1));
+        let mut payload_obj = serde_json::json!({
+            "round_id": round_id,
+            "tool_calls": tool_calls.clone(),
+        });
+        if content_absent {
+            payload_obj["content_absent"] = serde_json::Value::Bool(true);
+        }
+        if let Some(reasoning) = &reasoning_content {
+            payload_obj["reasoning_content"] = serde_json::Value::String(reasoning.clone());
+        }
+        if !redacted_thinking_blocks.is_empty()
+            && let Ok(serialized) = serde_json::to_value(&redacted_thinking_blocks)
+        {
+            payload_obj["thinking_blocks"] = serialized;
+        }
         let current = self.commit(
             session_id,
             turn_id,
-            snapshot.revision,
+            snapshot.session_revision,
             turn_revision,
             CommitSessionTurnUpdate::AppendTranscript {
-                source_key: format!("{turn_id}:assistant-tool-round:{first_tool_call_id}"),
+                source_key: bounded_source_key(
+                    "assistant-tool-round",
+                    format!("{turn_id}:assistant-tool-round:{round_id}:{first_tool_call_id}"),
+                ),
                 kind: TranscriptKind::Assistant,
                 text: assistant_text.clone(),
-                // This is intentionally more than display data: it is the
-                // durable ordered continuation queue.  A restart while an
-                // Ask call waits for approval reloads this exact assistant
-                // envelope and completes the remaining calls before another
-                // provider request can be made. A `length`-cut response
-                // never reaches this envelope: the truncated arm above
-                // fails the turn before any tool call can execute, because
-                // a cut call's arguments can be truncated at a syntacti-
-                // cally valid boundary and still pass schema validation.
-                payload: Some(serde_json::json!({"tool_calls":tool_calls.clone()})),
+                payload: Some(payload_obj),
             },
             lease,
         )?;
+        // Keep exact signed `thinking_blocks` in memory for immediate tool-round
+        // continuations so Anthropic signature verification succeeds while the
+        // durable transcript stores only `redacted_thinking_blocks`.
         messages.push(Message::Assistant {
             content: response.message,
+            reasoning_content,
+            thinking_blocks: raw_thinking_blocks,
             tool_calls: tool_calls.clone(),
         });
-        let round_sequence = current.sequence;
-        self.execute_tool_batch(current, messages, tool_calls, 0, round_sequence, lease)
+        let round = ToolRound {
+            round_id,
+            calls: tool_calls,
+        };
+        self.execute_tool_batch(current, messages, round, 0, lease)
             .await
     }
 
@@ -3643,37 +4117,56 @@ impl SessionRuntimeService {
         &self,
         mut current: SessionSnapshot,
         mut messages: Vec<Message>,
-        calls: Vec<crate::provider::ToolCall>,
-        start_ordinal: usize,
-        round_sequence: u64,
+        round: ToolRound,
+        start_call_ordinal: usize,
         lease: &SessionLeaseGuard,
     ) -> Result<ToolBatchOutcome, SessionRuntimeError> {
         let turn_id = current
             .active_turn_id
             .ok_or(SessionRuntimeError::InvalidState)?;
-        for (ordinal, call) in calls.into_iter().enumerate().skip(start_ordinal) {
-            let descriptor = SessionEffectDescriptor {
+        let round_id = round.round_id;
+        for (call_ordinal, call) in round.calls.into_iter().enumerate().skip(start_call_ordinal) {
+            let authority = EffectAuthority {
                 // Provider IDs only need to be unique within one response.
-                // Include the durable assistant sequence to prevent a later
-                // response reusing an ID from colliding with this effect.
-                effect_id: format!(
-                    "session-effect:{turn_id}:{round_sequence}:{ordinal}:{}",
-                    call.id
-                ),
+                // Include the durable round ID to prevent a later response
+                // reusing an ID from colliding with this effect.
+                effect_id: EffectId::for_tool_call(turn_id, round_id, call_ordinal, &call.id)
+                    .map_err(SessionRuntimeError::Effect)?,
                 tool_call_id: call.id.clone(),
                 name: call.name.clone(),
                 input: call.input.clone(),
                 attempt: 1,
             };
-            let prepared = self.engine.prepare_session_effect(
+            let outcome = self.engine.prepare_or_reject_session_effect(
                 session_effect_request(
                     &current,
-                    descriptor.clone(),
-                    format!("{turn_id}:effect:{}:{ordinal}:prepare", call.id),
+                    authority.clone(),
+                    bounded_source_key(
+                        "effect-prepare",
+                        format!(
+                            "{turn_id}:effect:{round_id}:{}:{call_ordinal}:prepare",
+                            call.id
+                        ),
+                    ),
                 )?,
                 lease,
                 now_ms(),
             )?;
+            let prepared = match outcome {
+                latte_engine::SessionEffectPrepareOutcome::Prepared(prepared) => prepared,
+                latte_engine::SessionEffectPrepareOutcome::Rejected {
+                    snapshot,
+                    error_json,
+                } => {
+                    current = snapshot;
+                    messages.push(Message::Tool {
+                        tool_call_id: call.id,
+                        name: Some(call.name),
+                        content: error_json,
+                    });
+                    continue;
+                }
+            };
             current = prepared.snapshot;
             if prepared.policy == latte_engine::SessionEffectPolicy::Ask {
                 return Ok(ToolBatchOutcome::Parked(current));
@@ -3681,8 +4174,14 @@ impl SessionRuntimeService {
             let started = self.engine.start_session_effect(
                 session_effect_start_request(
                     &current,
-                    descriptor.effect_id,
-                    format!("{turn_id}:effect:{}:{ordinal}:start", call.id),
+                    authority.effect_id,
+                    bounded_source_key(
+                        "effect-start",
+                        format!(
+                            "{turn_id}:effect:{round_id}:{}:{call_ordinal}:start",
+                            call.id
+                        ),
+                    ),
                 )?,
                 prepared.operation_digest,
                 lease,
@@ -3768,24 +4267,24 @@ impl SessionRuntimeService {
                     );
                     object.insert(
                         "tool_call_id".into(),
-                        serde_json::Value::String(started.presentation.tool_call_id.clone()),
+                        serde_json::Value::String(started.view.tool_call_id.clone()),
                     );
                     object.insert(
                         "name".into(),
-                        serde_json::Value::String(started.presentation.name.clone()),
+                        serde_json::Value::String(started.view.name.clone()),
                     );
                 }
                 value.payload = Some(payload);
+                let turn_id = started
+                    .snapshot
+                    .active_turn_id
+                    .ok_or(SessionRuntimeError::InvalidState)?;
                 self.engine
                     .observe_session_effect(
                         &started,
-                        format!(
-                            "{}:effect:{}:observe",
-                            started
-                                .snapshot
-                                .active_turn_id
-                                .ok_or(SessionRuntimeError::InvalidState)?,
-                            started.presentation.effect_id
+                        bounded_source_key(
+                            "effect-observe",
+                            format!("{turn_id}:effect:{}:observe", started.view.effect_id),
                         ),
                         SessionCommandId::from_uuid(Uuid::now_v7()),
                         value,
@@ -3795,50 +4294,54 @@ impl SessionRuntimeService {
                     .map(|observed| observed.snapshot)
                     .map_err(Into::into)
             }
-            Err(SessionEffectExecutionError::Certified(error)) => self
-                .engine
-                .observe_session_effect(
-                    &started,
-                    format!(
-                        "{}:effect:{}:observe-failed",
-                        started
-                            .snapshot
-                            .active_turn_id
-                            .ok_or(SessionRuntimeError::InvalidState)?,
-                        started.presentation.effect_id
-                    ),
-                    SessionCommandId::from_uuid(Uuid::now_v7()),
-                    latte_engine::SessionEffectObservedValue {
-                        result: serde_json::json!({"error":error}).to_string(),
-                        payload: Some(serde_json::json!({
-                            "tool_call_id":started.presentation.tool_call_id,
-                            "name":started.presentation.name,
-                            "error":error,
-                        })),
-                        success: false,
-                    },
-                    lease,
-                    now_ms(),
-                )
-                .map(|observed| observed.snapshot)
-                .map_err(Into::into),
-            Err(SessionEffectExecutionError::Uncertain(_error)) => self
-                .engine
-                .mark_session_effect_unknown(
-                    &started,
-                    format!(
-                        "{}:effect:{}:unknown",
-                        started
-                            .snapshot
-                            .active_turn_id
-                            .ok_or(SessionRuntimeError::InvalidState)?,
-                        started.presentation.effect_id
-                    ),
-                    SessionCommandId::from_uuid(Uuid::now_v7()),
-                    lease,
-                    now_ms(),
-                )
-                .map_err(Into::into),
+            Err(SessionEffectExecutionError::Certified(error)) => {
+                let result_json = serde_json::json!({"error": error}).to_string();
+                let turn_id = started
+                    .snapshot
+                    .active_turn_id
+                    .ok_or(SessionRuntimeError::InvalidState)?;
+                self.engine
+                    .observe_session_effect(
+                        &started,
+                        bounded_source_key(
+                            "effect-observe-failed",
+                            format!("{turn_id}:effect:{}:observe-failed", started.view.effect_id),
+                        ),
+                        SessionCommandId::from_uuid(Uuid::now_v7()),
+                        latte_engine::SessionEffectObservedValue {
+                            result: result_json.clone(),
+                            payload: Some(serde_json::json!({
+                                "provider_content": result_json,
+                                "tool_call_id": started.view.tool_call_id,
+                                "name": started.view.name,
+                                "error": error,
+                            })),
+                            success: false,
+                        },
+                        lease,
+                        now_ms(),
+                    )
+                    .map(|observed| observed.snapshot)
+                    .map_err(Into::into)
+            }
+            Err(SessionEffectExecutionError::Uncertain(_error)) => {
+                let turn_id = started
+                    .snapshot
+                    .active_turn_id
+                    .ok_or(SessionRuntimeError::InvalidState)?;
+                self.engine
+                    .mark_session_effect_unknown(
+                        &started,
+                        bounded_source_key(
+                            "effect-unknown",
+                            format!("{turn_id}:effect:{}:unknown", started.view.effect_id),
+                        ),
+                        SessionCommandId::from_uuid(Uuid::now_v7()),
+                        lease,
+                        now_ms(),
+                    )
+                    .map_err(Into::into)
+            }
         }
     }
 
@@ -3966,8 +4469,7 @@ impl SessionRuntimeService {
         // segments (completed history plus the open turn) and the same
         // non-persistent volatile tails, which only fill slack the mandatory
         // core leaves.
-        let mut entries: Vec<FitEntry> = segments.iter().cloned().map(FitEntry::history).collect();
-        entries.extend(volatile.fit_entries());
+        let entries = volatile.place_entries(&segments, Some(turn_id), None);
         let fit = Self::fit_request(&system, &entries, budget)?;
         let fitted_volatile = volatile.filtered(fit.repository_kept, fit.reminder_kept);
         let discarded = segments.len() - fit.history_kept;
@@ -4014,12 +4516,8 @@ impl SessionRuntimeService {
                 let cured = if forced {
                     true
                 } else if reactive {
-                    let mut cured_entries: Vec<FitEntry> = elided_segments
-                        .iter()
-                        .cloned()
-                        .map(FitEntry::history)
-                        .collect();
-                    cured_entries.extend(fitted_volatile.fit_entries());
+                    let cured_entries =
+                        fitted_volatile.place_entries(&elided_segments, Some(turn_id), None);
                     let cured_fit = Self::fit_request(&system, &cured_entries, budget)?;
                     cured_fit.history_kept == elided_segments.len()
                 } else {
@@ -4054,7 +4552,7 @@ impl SessionRuntimeService {
                         let post = self.commit(
                             snapshot.session_id,
                             turn_id,
-                            snapshot.revision,
+                            snapshot.session_revision,
                             turn_revision,
                             CommitSessionTurnUpdate::AppendTranscript {
                                 source_key: format!("{turn_id}:tool-result-elision:round:{round}"),
@@ -4150,7 +4648,7 @@ impl SessionRuntimeService {
             let audited = self.commit(
                 snapshot.session_id,
                 turn_id,
-                snapshot.revision,
+                snapshot.session_revision,
                 turn_revision,
                 CommitSessionTurnUpdate::AppendTranscript {
                     source_key: format!("{turn_id}:compact-summary-failed:round"),
@@ -4165,8 +4663,23 @@ impl SessionRuntimeService {
         if forced && self.compaction_breaker_tripped(snapshot.session_id) {
             return Ok(unchanged!());
         }
+        let (warm_prefix, repo_idx) = Self::assemble_request_with_repo_index(
+            &system,
+            None,
+            &segments[..boundary],
+            &VolatileTurnContext {
+                repository: volatile.repository.clone(),
+                reminder: None,
+            },
+            None,
+        );
         let summary = match self
-            .summarize_history(&snapshot, &source, Some(lease))
+            .summarize_history(
+                &snapshot,
+                &source,
+                Some((&warm_prefix, repo_idx)),
+                Some(lease),
+            )
             .await
         {
             // Provider-side failure: forced recovery reports no progress so
@@ -4210,7 +4723,7 @@ impl SessionRuntimeService {
         let post = self.commit(
             snapshot.session_id,
             turn_id,
-            snapshot.revision,
+            snapshot.session_revision,
             turn_revision,
             CommitSessionTurnUpdate::AppendTranscript {
                 source_key: format!("{turn_id}:compact-summary:round:{round}"),
@@ -4274,7 +4787,7 @@ impl SessionRuntimeService {
             let failed = self.fail_retryable(
                 session_id,
                 turn_id,
-                snapshot.revision,
+                snapshot.session_revision,
                 turn_revision,
                 error.to_string(),
                 lease,
@@ -4346,7 +4859,7 @@ impl SessionRuntimeService {
             Err(ProviderError::Cancelled) => self.commit(
                 session_id,
                 turn_id,
-                snapshot.revision,
+                snapshot.session_revision,
                 turn_revision,
                 CommitSessionTurnUpdate::Interrupt {
                     source_key: format!("{turn_id}:provider-cancel"),
@@ -4372,14 +4885,14 @@ impl SessionRuntimeService {
                         volatile,
                     )
                     .await?;
-                if rebased.revision == snapshot.revision {
+                if rebased.session_revision == snapshot.session_revision {
                     // No shrink was possible (no older eligible segments, a
                     // breaker trip, or a rebuilt request no smaller than the
                     // rejected one).
                     let failed = self.fail_retryable(
                         session_id,
                         turn_id,
-                        snapshot.revision,
+                        snapshot.session_revision,
                         turn_revision,
                         "provider rejected the request as over its context window and no older history could be shrunk".to_owned(),
                         lease,
@@ -4416,7 +4929,7 @@ impl SessionRuntimeService {
                     let stopped = self.fail(
                         session_id,
                         turn_id,
-                        snapshot.revision,
+                        snapshot.session_revision,
                         turn_revision,
                         format!("provider: {error}"),
                         lease,
@@ -4426,7 +4939,7 @@ impl SessionRuntimeService {
                 self.fail_retryable(
                     session_id,
                     turn_id,
-                    snapshot.revision,
+                    snapshot.session_revision,
                     turn_revision,
                     format!("provider: {error}"),
                     lease,
@@ -4483,7 +4996,7 @@ impl SessionRuntimeService {
                     let appended = self.commit(
                         session_id,
                         turn_id,
-                        snapshot.revision,
+                        snapshot.session_revision,
                         turn_revision,
                         CommitSessionTurnUpdate::AppendTranscript {
                             source_key: format!("{turn_id}:assistant-{source_suffix}"),
@@ -4496,7 +5009,7 @@ impl SessionRuntimeService {
                     let stopped = self.fail_retryable(
                         session_id,
                         turn_id,
-                        appended.revision,
+                        appended.session_revision,
                         turn_revision,
                         reason.into(),
                         lease,
@@ -4506,7 +5019,7 @@ impl SessionRuntimeService {
                 let stopped = self.fail_retryable(
                     session_id,
                     turn_id,
-                    snapshot.revision,
+                    snapshot.session_revision,
                     turn_revision,
                     reason.into(),
                     lease,
@@ -4528,7 +5041,7 @@ impl SessionRuntimeService {
                     self.fail(
                         session_id,
                         turn_id,
-                        snapshot.revision,
+                        snapshot.session_revision,
                         turn_revision,
                         "provider requested unsupported secret or invalid input".into(),
                         lease,
@@ -4537,7 +5050,7 @@ impl SessionRuntimeService {
                     self.commit(
                         session_id,
                         turn_id,
-                        snapshot.revision,
+                        snapshot.session_revision,
                         turn_revision,
                         CommitSessionTurnUpdate::RequestInput {
                             source_key: format!("{turn_id}:input-request:{}", input.id),
@@ -4561,7 +5074,7 @@ impl SessionRuntimeService {
                     let stopped = self.fail_retryable(
                         session_id,
                         turn_id,
-                        snapshot.revision,
+                        snapshot.session_revision,
                         turn_revision,
                         format!(
                             "turn stopped after {} tool rounds without completing;                              raise or remove session.max_tool_rounds, or narrow the task",
@@ -4593,58 +5106,77 @@ impl SessionRuntimeService {
                 // truncated arm above fails the turn first, for the
                 // final-text shape and the tool-call shape alike. What
                 // remains is a complete outcome.
+                let final_reasoning = response.reasoning_content().map(redact_session_text);
+                let final_thinking = redact_thinking_blocks(&response.thinking_blocks());
                 let Some(message) = response.message.filter(|value| !value.trim().is_empty())
                 else {
                     let failed = self.fail(
                         session_id,
                         turn_id,
-                        snapshot.revision,
+                        snapshot.session_revision,
                         turn_revision,
                         "provider returned an empty assistant outcome".into(),
                         lease,
                     )?;
                     return Ok(RoundFlow::Done(failed));
                 };
+                let final_payload = if final_reasoning.is_none() && final_thinking.is_empty() {
+                    None
+                } else {
+                    let mut map = serde_json::Map::new();
+                    if let Some(reasoning) = final_reasoning {
+                        map.insert(
+                            "reasoning_content".into(),
+                            serde_json::Value::String(reasoning),
+                        );
+                    }
+                    if !final_thinking.is_empty()
+                        && let Ok(serialized) = serde_json::to_value(&final_thinking)
+                    {
+                        map.insert("thinking_blocks".into(), serialized);
+                    }
+                    Some(serde_json::Value::Object(map))
+                };
                 let appended = self.commit(
                     session_id,
                     turn_id,
-                    snapshot.revision,
+                    snapshot.session_revision,
                     turn_revision,
                     CommitSessionTurnUpdate::AppendTranscript {
                         source_key: format!("{turn_id}:assistant-final"),
                         kind: TranscriptKind::Assistant,
                         text: message.clone(),
-                        payload: None,
+                        payload: final_payload,
                     },
                     lease,
                 )?;
                 let changed = self.engine.session_turn_changed_files(turn_id)?;
                 if !changed.is_empty() {
-                    if self.verification.is_none() {
+                    if self.verification.is_some() {
+                        let verified = self.begin_verification(appended, message, lease).await?;
+                        return Ok(RoundFlow::Done(verified));
+                    } else if self.engine.requires_verification() {
                         let failed = self.fail(
                             session_id,
                             turn_id,
-                            appended.revision,
+                            appended.session_revision,
                             turn_revision,
-                            "workspace changed but no configured verification plan is available"
-                                .into(),
+                            "workspace changed without a configured verification plan".into(),
                             lease,
                         )?;
                         return Ok(RoundFlow::Done(failed));
                     }
-                    let verified = self.begin_verification(appended, message, lease).await?;
-                    return Ok(RoundFlow::Done(verified));
                 }
                 snapshot = self.commit(
                     session_id,
                     turn_id,
-                    appended.revision,
+                    appended.session_revision,
                     turn_revision,
                     CommitSessionTurnUpdate::Complete {
                         source_key: format!("{turn_id}:complete"),
                         handoff: latte_core::Handoff {
                             summary: message,
-                            files_changed: Vec::new(),
+                            files_changed: changed,
                             evidence: Vec::new(),
                         },
                     },
@@ -4709,6 +5241,30 @@ impl SessionRuntimeService {
         retryability: Retryability,
         lease: &Lease,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
+        self.fail_with_code(
+            session_id,
+            turn_id,
+            session_revision,
+            turn_revision,
+            FailureCode::RuntimeFailed,
+            message,
+            retryability,
+            lease,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fail_with_code(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        session_revision: u64,
+        turn_revision: u64,
+        code: FailureCode,
+        message: &str,
+        retryability: Retryability,
+        lease: &Lease,
+    ) -> Result<SessionSnapshot, SessionRuntimeError> {
         self.commit(
             session_id,
             turn_id,
@@ -4717,7 +5273,7 @@ impl SessionRuntimeService {
             CommitSessionTurnUpdate::Fail {
                 source_key: format!("{turn_id}:failure"),
                 failure: TurnFailure {
-                    code: FailureCode::RuntimeFailed,
+                    code,
                     message: redact_session_text(message),
                     retryability,
                 },
@@ -4757,6 +5313,63 @@ impl SessionRuntimeService {
 
     fn acquire(&self, session_id: SessionId) -> Result<SessionLeaseGuard, SessionRuntimeError> {
         self.acquire_with_ttl(session_id, self.authority_ttl())
+    }
+
+    const PARKED_LEASE_SETTLE_MS: u64 = 250;
+
+    fn should_retry_parked_lease(
+        &self,
+        session_id: SessionId,
+        deadline: Instant,
+        error: &SessionRuntimeError,
+    ) -> bool {
+        matches!(
+            error,
+            SessionRuntimeError::Storage(StorageError::EngineUnavailable)
+        ) && Instant::now() < deadline
+            && self.load_full(session_id).is_ok_and(|current| {
+                matches!(
+                    current.lifecycle,
+                    SessionLifecycle::WaitingPermission | SessionLifecycle::WaitingInput
+                )
+            })
+    }
+
+    /// Acquires the session lease for an already-parked (`WaitingPermission` /
+    /// `WaitingInput`) session, giving a just-parked runner task up to a bounded
+    /// settle window to finish stack unwinding and drop its `SessionLeaseGuard`.
+    fn acquire_parked(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionLeaseGuard, SessionRuntimeError> {
+        let deadline = Instant::now()
+            + Duration::from_millis(RESIDUE_SETTLE_BUDGET_MS.max(Self::PARKED_LEASE_SETTLE_MS));
+        loop {
+            match self.acquire(session_id) {
+                Ok(lease) => return Ok(lease),
+                Err(error) if self.should_retry_parked_lease(session_id, deadline, &error) => {
+                    std::thread::sleep(Duration::from_millis(RESIDUE_SETTLE_INTERVAL_MS));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn acquire_parked_async(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionLeaseGuard, SessionRuntimeError> {
+        let deadline = Instant::now()
+            + Duration::from_millis(RESIDUE_SETTLE_BUDGET_MS.max(Self::PARKED_LEASE_SETTLE_MS));
+        loop {
+            match self.acquire(session_id) {
+                Ok(lease) => return Ok(lease),
+                Err(error) if self.should_retry_parked_lease(session_id, deadline, &error) => {
+                    tokio::time::sleep(Duration::from_millis(RESIDUE_SETTLE_INTERVAL_MS)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn acquire_with_ttl(
@@ -4821,16 +5434,51 @@ impl SessionRuntimeService {
         started: &SessionEffectStarted,
         lease: &Lease,
     ) -> Result<SessionSnapshot, SessionRuntimeError> {
+        let turn_id = started
+            .snapshot
+            .active_turn_id
+            .ok_or(SessionRuntimeError::InvalidState)?;
+        if is_readonly_session_tool(&started.view.name) {
+            let observed = self.engine.observe_session_effect(
+                started,
+                bounded_source_key(
+                    "effect-cancelled-readonly",
+                    format!(
+                        "{turn_id}:effect:{}:cancelled-readonly",
+                        started.view.effect_id
+                    ),
+                ),
+                SessionCommandId::from_uuid(Uuid::now_v7()),
+                latte_engine::SessionEffectObservedValue {
+                    result: serde_json::json!({ "error": "cancelled" }).to_string(),
+                    payload: None,
+                    success: false,
+                },
+                lease,
+                now_ms(),
+            )?;
+            let revision = active_turn_revision(&observed.snapshot)?;
+            return self.commit(
+                observed.snapshot.session_id,
+                turn_id,
+                observed.snapshot.session_revision,
+                revision,
+                CommitSessionTurnUpdate::Interrupt {
+                    source_key: format!("{turn_id}:interrupt-cancelled-readonly"),
+                    reconciliation_effect_id: None,
+                },
+                lease,
+            );
+        }
         self.engine
             .mark_session_effect_unknown(
                 started,
-                format!(
-                    "{}:effect:{}:cancelled-after-start",
-                    started
-                        .snapshot
-                        .active_turn_id
-                        .ok_or(SessionRuntimeError::InvalidState)?,
-                    started.presentation.effect_id
+                bounded_source_key(
+                    "effect-cancelled",
+                    format!(
+                        "{turn_id}:effect:{}:cancelled-after-start",
+                        started.view.effect_id
+                    ),
                 ),
                 SessionCommandId::from_uuid(Uuid::now_v7()),
                 lease,
@@ -4971,7 +5619,7 @@ fn active_turn_revision(snapshot: &SessionSnapshot) -> Result<u64, SessionRuntim
 
 fn session_effect_request(
     snapshot: &SessionSnapshot,
-    descriptor: SessionEffectDescriptor,
+    authority: EffectAuthority,
     source_key: String,
 ) -> Result<SessionEffectRequest, SessionRuntimeError> {
     Ok(SessionEffectRequest {
@@ -4979,17 +5627,17 @@ fn session_effect_request(
         turn_id: snapshot
             .active_turn_id
             .ok_or(SessionRuntimeError::InvalidState)?,
-        expected_session_revision: snapshot.revision,
+        expected_session_revision: snapshot.session_revision,
         expected_turn_revision: active_turn_revision(snapshot)?,
         command_id: SessionCommandId::from_uuid(Uuid::now_v7()),
         source_key,
-        descriptor,
+        authority,
     })
 }
 
 fn session_effect_start_request(
     snapshot: &SessionSnapshot,
-    effect_id: String,
+    effect_id: EffectId,
     source_key: String,
 ) -> Result<SessionEffectStartRequest, SessionRuntimeError> {
     Ok(SessionEffectStartRequest {
@@ -4997,12 +5645,22 @@ fn session_effect_start_request(
         turn_id: snapshot
             .active_turn_id
             .ok_or(SessionRuntimeError::InvalidState)?,
-        expected_session_revision: snapshot.revision,
+        expected_session_revision: snapshot.session_revision,
         expected_turn_revision: active_turn_revision(snapshot)?,
         command_id: SessionCommandId::from_uuid(Uuid::now_v7()),
         source_key,
         effect_id,
     })
+}
+
+struct ToolRound {
+    round_id: RoundId,
+    calls: Vec<crate::provider::ToolCall>,
+}
+
+struct ToolRoundPosition {
+    round: ToolRound,
+    call_ordinal: usize,
 }
 
 /// Finds the exact persisted provider round containing an approved descriptor.
@@ -5012,8 +5670,9 @@ fn session_effect_start_request(
 /// same ordered queue it had before the permission pause.
 fn tool_round_for_call(
     snapshot: &SessionSnapshot,
+    expected_round_id: Option<RoundId>,
     tool_call_id: &str,
-) -> Result<(u64, Vec<crate::provider::ToolCall>, usize), SessionRuntimeError> {
+) -> Result<ToolRoundPosition, SessionRuntimeError> {
     snapshot
         .transcript
         .entries
@@ -5021,18 +5680,26 @@ fn tool_round_for_call(
         .rev()
         .filter(|entry| entry.kind == TranscriptKind::Assistant)
         .find_map(|entry| {
-            let calls = entry
-                .payload
-                .as_ref()?
-                .get("tool_calls")
-                .cloned()
-                .and_then(|value| {
-                    serde_json::from_value::<Vec<crate::provider::ToolCall>>(value).ok()
-                })?;
+            let payload = entry.payload.as_ref()?;
+            let round_id = payload
+                .get("round_id")
+                .and_then(serde_json::Value::as_u64)
+                .map_or_else(|| RoundId::from_u64(entry.sequence), RoundId::from_u64);
+            if let Some(expected) = expected_round_id
+                && round_id != expected
+            {
+                return None;
+            }
+            let calls = payload.get("tool_calls").cloned().and_then(|value| {
+                serde_json::from_value::<Vec<crate::provider::ToolCall>>(value).ok()
+            })?;
             calls
                 .iter()
                 .position(|call| call.id == tool_call_id)
-                .map(|ordinal| (entry.sequence, calls, ordinal))
+                .map(|call_ordinal| ToolRoundPosition {
+                    round: ToolRound { round_id, calls },
+                    call_ordinal,
+                })
         })
         .ok_or_else(|| {
             SessionRuntimeError::Effect(
@@ -5256,7 +5923,7 @@ mod tests {
 
     fn binding() -> SessionProviderBinding {
         SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "p".into(),
             provider_type: "test".into(),
             protocol: "test".into(),
@@ -5298,7 +5965,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(
@@ -5373,7 +6040,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(
@@ -5564,7 +6231,7 @@ mod tests {
             } else {
                 Ok(ResolvedProvider {
                     provider: provider.clone(),
-                    binding: crate::registry::ProviderBinding::direct(&[]),
+                    binding: crate::registry::ProviderModelBinding::direct(&[]),
                 })
             }
         });
@@ -5581,7 +6248,11 @@ mod tests {
             .unwrap();
 
         let failed = service
-            .follow_up(session_id, complete.revision, "durable follow-up".into())
+            .follow_up(
+                session_id,
+                complete.session_revision,
+                "durable follow-up".into(),
+            )
             .await
             .unwrap();
 
@@ -5604,7 +6275,11 @@ mod tests {
         }));
 
         let retried = service
-            .follow_up(session_id, failed.revision, "retry after config fix".into())
+            .follow_up(
+                session_id,
+                failed.session_revision,
+                "retry after config fix".into(),
+            )
             .await
             .unwrap();
         assert_eq!(retried.lifecycle, SessionLifecycle::Ready);
@@ -5648,7 +6323,7 @@ mod tests {
                         provider_state: None,
                     },
                 ])),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(
@@ -5664,7 +6339,7 @@ mod tests {
             .unwrap();
         let parent = complete.latest_turn_id.unwrap();
         let child = service
-            .follow_up(session_id, complete.revision, "two".into())
+            .follow_up(session_id, complete.session_revision, "two".into())
             .await
             .unwrap();
         assert_eq!(child.lifecycle, SessionLifecycle::Ready);
@@ -5708,7 +6383,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         SessionRuntimeService::new(engine, root, policy, factory)
@@ -5755,7 +6430,7 @@ mod tests {
                         retryable,
                     },
                 )))),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         SessionRuntimeService::new(engine, root, SessionHistoryPolicy::default(), factory)
@@ -6212,7 +6887,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         SessionRuntimeService::new(engine, root, SessionHistoryPolicy::default(), factory)
@@ -6226,7 +6901,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         SessionRuntimeService::new(engine, root, SessionHistoryPolicy::default(), factory)
@@ -6252,14 +6927,14 @@ mod tests {
 
         assert_eq!(
             service
-                .switch_model(session_id, ready.revision, &ready.binding)
+                .switch_model(session_id, ready.session_revision, &ready.binding)
                 .unwrap(),
             ready
         );
         let mut invalid = binding();
         invalid.provider_name.clear();
         assert!(matches!(
-            service.switch_model(session_id, ready.revision, &invalid),
+            service.switch_model(session_id, ready.session_revision, &invalid),
             Err(SessionRuntimeError::ProviderConfiguration(_))
         ));
         let mut next = binding();
@@ -6267,12 +6942,12 @@ mod tests {
         next.model = "reasoning".into();
         next.config_fingerprint = "other-config".into();
         assert!(matches!(
-            service.switch_model(session_id, ready.revision + 1, &next),
+            service.switch_model(session_id, ready.session_revision + 1, &next),
             Err(SessionRuntimeError::InvalidState)
         ));
 
         let switched = service
-            .switch_model(session_id, ready.revision, &next)
+            .switch_model(session_id, ready.session_revision, &next)
             .unwrap();
         assert_eq!(switched.binding, next);
         assert!(switched.transcript.entries.iter().any(|entry| {
@@ -6395,7 +7070,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn v2_uncertain_process_launch_requires_reconciliation_without_tool_result() {
+        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
+        let ro_dir = root.path().join("readonly_dir");
+        std::fs::create_dir(&ro_dir).unwrap();
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
             .build()
@@ -6405,11 +7084,15 @@ mod tests {
             engine.clone(),
             vec![
                 response(
-                    Some("attempting failed process"),
+                    Some("attempting uncertain write"),
                     vec![crate::provider::ToolCall {
-                        id: "failed-process".into(),
-                        name: "process".into(),
-                        input: serde_json::json!({"argv":["/definitely-missing-latte-command"]}),
+                        id: "uncertain-write".into(),
+                        name: "write_file".into(),
+                        input: serde_json::json!({
+                            "path": "readonly_dir/out.txt",
+                            "content": "x",
+                            "create_intent": true,
+                        }),
                     }],
                 ),
                 response(Some("must not be reached"), vec![]),
@@ -6432,7 +7115,7 @@ mod tests {
         let terminal = service
             .resolve_permission(
                 waiting.session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 request_id,
                 true,
@@ -6555,7 +7238,7 @@ mod tests {
         let done = service
             .resolve_permission(
                 waiting.session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 request_id,
                 true,
@@ -6640,7 +7323,7 @@ mod tests {
         let completed = service
             .resolve_permission(
                 waiting.session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 request_id.clone(),
                 true,
@@ -6772,7 +7455,7 @@ mod tests {
         let completed = service
             .resolve_permission(
                 waiting.session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 request_id,
                 true,
@@ -6833,7 +7516,7 @@ mod tests {
         let completed = service
             .resolve_permission(
                 waiting.session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 request_id,
                 true,
@@ -6884,7 +7567,7 @@ mod tests {
         let denied = service
             .resolve_permission(
                 waiting.session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 request_id,
                 false,
@@ -6899,7 +7582,7 @@ mod tests {
         let continued = service
             .follow_up(
                 denied.session_id,
-                denied.revision,
+                denied.session_revision,
                 "continue without those tools".into(),
             )
             .await
@@ -6952,7 +7635,7 @@ mod tests {
             .with_verification(passing_verification())
             .resolve_permission(
                 waiting.session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 request_id,
                 true,
@@ -7035,24 +7718,24 @@ mod tests {
             latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
             latte_core::SessionPendingRequest::Input { .. } => panic!("expected permission"),
         };
-        let failed = mutated
+        let completed = mutated
             .resolve_permission(
                 waiting.session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 request_id,
                 true,
             )
             .await
             .unwrap();
-        assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
-        assert!(
-            engine
-                .show(failed.latest_turn_id.unwrap())
-                .unwrap()
-                .handoff
-                .is_none()
-        );
+        assert_eq!(completed.lifecycle, SessionLifecycle::Ready);
+        let mutated_handoff = engine
+            .show(completed.latest_turn_id.unwrap())
+            .unwrap()
+            .handoff
+            .unwrap();
+        assert_eq!(mutated_handoff.files_changed, vec!["new.txt".to_owned()]);
+        assert!(mutated_handoff.evidence.is_empty());
     }
 
     #[cfg(unix)]
@@ -7091,14 +7774,14 @@ mod tests {
         let failed = service
             .resolve_permission(
                 waiting.session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 request_id,
                 true,
             )
             .await
             .unwrap();
-        assert_eq!(failed.lifecycle, SessionLifecycle::Failed);
+        assert_eq!(failed.lifecycle, SessionLifecycle::Ready);
         let run = engine.show(failed.latest_turn_id.unwrap()).unwrap();
         assert_eq!(run.status, latte_core::TurnStatus::Failed);
         assert!(run.handoff.is_none());
@@ -7152,7 +7835,7 @@ mod tests {
         let waiting_verification = service
             .resolve_permission(
                 waiting_tool.session_id,
-                waiting_tool.revision,
+                waiting_tool.session_revision,
                 test_turn_revision(&waiting_tool),
                 tool_request,
                 true,
@@ -7172,7 +7855,7 @@ mod tests {
         let complete = service
             .resolve_permission(
                 waiting_verification.session_id,
-                waiting_verification.revision,
+                waiting_verification.session_revision,
                 test_turn_revision(&waiting_verification),
                 verification_request,
                 true,
@@ -7231,7 +7914,7 @@ mod tests {
         let completed = service
             .provide_input(
                 waiting.session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 "language".into(),
                 "Rust".into(),
@@ -7250,7 +7933,7 @@ mod tests {
             service
                 .provide_input(
                     waiting.session_id,
-                    waiting.revision,
+                    waiting.session_revision,
                     test_turn_revision(&waiting),
                     "language".into(),
                     "again".into()
@@ -7739,7 +8422,7 @@ mod tests {
             let terminal = if cancel {
                 let turn_revision = active_turn_revision(&waiting).unwrap();
                 service
-                    .cancel_durable(waiting.session_id, waiting.revision, turn_revision)
+                    .cancel_durable(waiting.session_id, waiting.session_revision, turn_revision)
                     .unwrap()
             } else {
                 let request_id = match waiting.pending.as_ref().unwrap() {
@@ -7753,7 +8436,7 @@ mod tests {
                 service
                     .resolve_permission(
                         waiting.session_id,
-                        waiting.revision,
+                        waiting.session_revision,
                         test_turn_revision(&waiting),
                         request_id,
                         false,
@@ -7868,7 +8551,7 @@ mod tests {
                     Duration::from_millis(200),
                     response(Some("done"), vec![]),
                 )])),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(
@@ -8018,7 +8701,7 @@ mod tests {
             runner
                 .resolve_permission(
                     session_id,
-                    waiting.revision,
+                    waiting.session_revision,
                     test_turn_revision(&waiting),
                     request_id,
                     true,
@@ -8118,7 +8801,7 @@ mod tests {
             runner
                 .resolve_permission(
                     session_id,
-                    waiting.revision,
+                    waiting.session_revision,
                     test_turn_revision(&waiting),
                     request_id,
                     true,
@@ -8227,8 +8910,8 @@ mod tests {
             )
             .unwrap()
             .snapshot;
-        let descriptor = SessionEffectDescriptor {
-            effect_id: format!("session-effect:{turn_id}:recover"),
+        let descriptor = EffectAuthority {
+            effect_id: format!("session-effect:{turn_id}:recover").parse().unwrap(),
             tool_call_id: "recover".into(),
             name: "read_file".into(),
             input: serde_json::json!({"path":"note.txt"}),
@@ -8282,7 +8965,9 @@ mod tests {
         );
         assert!(recovered.active_turn_id.is_none());
         assert_eq!(
-            reopened.effect_status(&descriptor.effect_id).unwrap(),
+            reopened
+                .effect_status(descriptor.effect_id.as_str())
+                .unwrap(),
             latte_engine::EffectStatus::Unknown
         );
         assert_eq!(
@@ -8304,7 +8989,7 @@ mod tests {
         }));
         let service = scripted_service(root.path(), reopened.clone(), vec![]);
         let reconciled = service
-            .reconcile_unknown_effect(session_id, &descriptor.effect_id)
+            .reconcile_unknown_effect(session_id, descriptor.effect_id.as_str())
             .unwrap();
         assert_eq!(reconciled.lifecycle, SessionLifecycle::Failed);
         assert!(reconciled.active_turn_id.is_none());
@@ -8313,7 +8998,9 @@ mod tests {
             latte_core::TurnStatus::Failed
         );
         assert_eq!(
-            reopened.effect_status(&descriptor.effect_id).unwrap(),
+            reopened
+                .effect_status(descriptor.effect_id.as_str())
+                .unwrap(),
             latte_engine::EffectStatus::ObservedFailed
         );
     }
@@ -8354,8 +9041,10 @@ mod tests {
             )
             .unwrap()
             .snapshot;
-        let descriptor = SessionEffectDescriptor {
-            effect_id: format!("session-effect:{turn_id}:prepared"),
+        let descriptor = EffectAuthority {
+            effect_id: format!("session-effect:{turn_id}:prepared")
+                .parse()
+                .unwrap(),
             tool_call_id: "prepared".into(),
             name: "write_file".into(),
             input: serde_json::json!({
@@ -8388,7 +9077,9 @@ mod tests {
         assert_eq!(recovered.lifecycle, SessionLifecycle::Interrupted);
         assert!(recovered.active_turn_id.is_none());
         assert_eq!(
-            reopened.effect_status(&descriptor.effect_id).unwrap(),
+            reopened
+                .effect_status(descriptor.effect_id.as_str())
+                .unwrap(),
             latte_engine::EffectStatus::ObservedFailed
         );
         assert_eq!(
@@ -8419,7 +9110,7 @@ mod tests {
 
         assert!(matches!(
             service
-                .follow_up(session_id, running.revision, "too early".into())
+                .follow_up(session_id, running.session_revision, "too early".into())
                 .await,
             Err(SessionRuntimeError::InvalidState)
         ));
@@ -8427,7 +9118,7 @@ mod tests {
             service
                 .provide_input(
                     session_id,
-                    running.revision,
+                    running.session_revision,
                     test_turn_revision(&running),
                     "missing".into(),
                     "value".into()
@@ -8439,7 +9130,7 @@ mod tests {
             service
                 .resolve_permission(
                     session_id,
-                    running.revision,
+                    running.session_revision,
                     test_turn_revision(&running),
                     "missing".into(),
                     true
@@ -8470,7 +9161,7 @@ mod tests {
         let live_turn_revision = active_turn_revision(&live).unwrap();
         assert_eq!(
             service
-                .cancel_durable(session_id, live.revision, live_turn_revision)
+                .cancel_durable(session_id, live.session_revision, live_turn_revision)
                 .unwrap()
                 .session_id,
             session_id,
@@ -8553,7 +9244,7 @@ mod tests {
         snapshot.turns = vec![SessionTurnSummary {
             turn_id: new_turn_id(),
             parent_turn_id: None,
-            ordinal: 0,
+            turn_ordinal: 0,
             status: SessionTurnStatus::Running,
             turn_revision: 1,
             completed_at_ms: None,
@@ -8565,7 +9256,7 @@ mod tests {
         ));
         assert!(verified.recover_lease_loss(&snapshot, &live, "test").to_string().contains("linked turn revision is unavailable"));
         snapshot.turns[0].turn_id = turn_id;
-        let presentation = SessionEffectPresentation { effect_id: descriptor.effect_id.clone(), tool_call_id: descriptor.tool_call_id.clone(), name: descriptor.name.clone(), input: descriptor.input.clone(), attempt: descriptor.attempt };
+        let presentation = EffectView { effect_id: descriptor.effect_id.clone(), tool_call_id: descriptor.tool_call_id.clone(), name: descriptor.name.clone(), input: descriptor.input.clone(), attempt: descriptor.attempt };
         assert!(verified.finish_verification(&snapshot, &presentation, &live).unwrap_err().to_string().contains("observation is missing"));
 
         let call = crate::provider::ToolCall {
@@ -8618,9 +9309,12 @@ mod tests {
                 created_at_ms: 5,
             },
         ];
-        let (sequence, calls, ordinal) = tool_round_for_call(&snapshot, "call-1").unwrap();
-        assert_eq!((sequence, calls, ordinal), (2, vec![call], 0));
-        assert!(tool_round_for_call(&snapshot, "missing").is_err());
+        let position = tool_round_for_call(&snapshot, None, "call-1").unwrap();
+        assert_eq!(
+            (position.round.round_id, position.round.calls, position.call_ordinal),
+            (RoundId::from_u64(2), vec![call], 0)
+        );
+        assert!(tool_round_for_call(&snapshot, None, "missing").is_err());
         assert_eq!(
             effect_provider_result(&snapshot, "call-1").as_deref(),
             Some("provider-safe-result")
@@ -8645,7 +9339,7 @@ mod tests {
             engine: verified.engine.clone(),
             lease: takeover,
         };
-        for index in 0..501 { running = verified.commit(session_id, turn_id, running.revision, 1, CommitSessionTurnUpdate::AppendTranscript { source_key: format!("helper:page:{index}"), kind: TranscriptKind::System, text: index.to_string(), payload: None }, &live).unwrap(); }
+        for index in 0..501 { running = verified.commit(session_id, turn_id, running.session_revision, 1, CommitSessionTurnUpdate::AppendTranscript { source_key: format!("helper:page:{index}"), kind: TranscriptKind::System, text: index.to_string(), payload: None }, &live).unwrap(); }
         assert_eq!(verified.load_full(session_id).unwrap().transcript.entries.len(), 502);
         let mut observed = running.clone();
         observed.transcript = snapshot.transcript.clone();
@@ -8654,14 +9348,16 @@ mod tests {
         assert!(verified.finish_verification(&observed, &presentation, &live).unwrap_err().to_string().contains("not a process result"));
         let mut output = latte_engine::ProcessOutput { exit_code: Some(0), stdout: String::new(), stderr: String::new(), stdout_truncated: false, stderr_truncated: false, termination: latte_engine::ProcessTermination::Exited };
         observed.transcript.entries.last_mut().unwrap().payload.as_mut().unwrap()["provider_content"] = serde_json::Value::String(serde_json::to_string(&output).unwrap());
-        presentation.effect_id = "missing-summary".into();
+        presentation.effect_id = "missing-summary".parse().unwrap();
         presentation.input = serde_json::json!({});
         assert!(verified.finish_verification(&observed, &presentation, &live).unwrap_err().to_string().contains("completion summary is missing"));
         output.exit_code = Some(1);
         observed.transcript.entries.last_mut().unwrap().payload.as_mut().unwrap()["provider_content"] = serde_json::Value::String(serde_json::to_string(&output).unwrap());
-        presentation.effect_id = "failed-verification".into();
+        presentation.effect_id = "failed-verification".parse().unwrap();
         presentation.input = descriptor.input;
-        assert_eq!(verified.finish_verification(&observed, &presentation, &live).unwrap().lifecycle, SessionLifecycle::Failed);
+        let failed_ver = verified.finish_verification(&observed, &presentation, &live).unwrap();
+        assert_eq!(failed_ver.lifecycle, SessionLifecycle::Ready);
+        assert_eq!(failed_ver.turns[0].status, latte_core::SessionTurnStatus::Failed);
         verified.engine.release_lease(&live).unwrap(); assert!(verified.recover_lease_loss(&observed, &live, "test").to_string().contains("already terminal"));
     }
 
@@ -8772,7 +9468,7 @@ mod tests {
                     .follow_up_accepted(
                         session_id,
                         SessionCommandId::from_uuid(Uuid::now_v7()),
-                        ready.revision,
+                        ready.session_revision,
                         "second".into(),
                         tx,
                     )
@@ -8836,13 +9532,19 @@ mod tests {
             let service = service.clone();
             tokio::spawn(async move {
                 service
-                    .follow_up_accepted(session_id, command_id, ready.revision, "second".into(), tx)
+                    .follow_up_accepted(
+                        session_id,
+                        command_id,
+                        ready.session_revision,
+                        "second".into(),
+                        tx,
+                    )
                     .await
             })
         };
         let accepted = rx.await.unwrap().expect("follow-up accepted");
         let first_revision = match accepted {
-            latte_core::CreateOutcome::Created(snapshot) => snapshot.revision,
+            latte_core::CreateOutcome::Created(snapshot) => snapshot.session_revision,
             latte_core::CreateOutcome::Replayed(_) => panic!("first follow-up must be Created"),
         };
         handle.await.unwrap().unwrap();
@@ -8858,19 +9560,25 @@ mod tests {
 
         // Replay with the same command_id + payload → Replayed (no new turn).
         let replay = service
-            .follow_up(session_id, ready2.revision, "second".into())
+            .follow_up(session_id, ready2.session_revision, "second".into())
             .await;
         // follow_up mints a fresh command_id, so this is a new follow-up, not
         // a replay. To test the durable replay, use follow_up_accepted with
         // the same command_id.
         let (tx, rx) = oneshot::channel();
         let replayed = service
-            .follow_up_accepted(session_id, command_id, ready.revision, "second".into(), tx)
+            .follow_up_accepted(
+                session_id,
+                command_id,
+                ready.session_revision,
+                "second".into(),
+                tx,
+            )
             .await
             .unwrap();
         match replayed {
             latte_core::CreateOutcome::Replayed(snapshot) => {
-                assert_eq!(snapshot.revision, first_revision);
+                assert_eq!(snapshot.session_revision, first_revision);
             }
             latte_core::CreateOutcome::Created(_) => {
                 panic!("same command_id replay must be Replayed")
@@ -8885,7 +9593,7 @@ mod tests {
             .follow_up_accepted(
                 session_id,
                 command_id,
-                ready.revision,
+                ready.session_revision,
                 "DIFFERENT".into(),
                 tx,
             )
@@ -8907,6 +9615,8 @@ mod tests {
         let mut segment = vec![
             Message::Assistant {
                 content: Some("calling tools".into()),
+                reasoning_content: None,
+                thinking_blocks: vec![],
                 tool_calls: vec![
                     ToolCall {
                         id: "call-1".into(),
@@ -9115,6 +9825,8 @@ mod tests {
         let segment = vec![
             Message::Assistant {
                 content: None,
+                reasoning_content: None,
+                thinking_blocks: vec![],
                 tool_calls: vec![ToolCall {
                     id: "call-1".into(),
                     name: "read_file".into(),
@@ -9235,11 +9947,12 @@ mod tests {
         let turn_id = TurnId::from_uuid(SystemIdSource::default().next_uuid_v7());
         let snapshot = SessionSnapshot {
             session_id: SessionId::from_uuid(SystemIdSource::default().next_uuid_v7()),
-            revision: 1,
+            session_revision: 1,
             sequence: 1,
             lifecycle: SessionLifecycle::Running,
+            permission_mode: latte_core::PermissionMode::Ask,
             binding: SessionProviderBinding {
-                version: 2,
+                binding_version: 2,
                 provider_name: String::new(),
                 provider_type: String::new(),
                 protocol: String::new(),
@@ -9257,7 +9970,7 @@ mod tests {
             turns: vec![SessionTurnSummary {
                 turn_id,
                 parent_turn_id: None,
-                ordinal: 0,
+                turn_ordinal: 0,
                 status: SessionTurnStatus::Running,
                 turn_revision: 7,
                 completed_at_ms: None,
@@ -9509,7 +10222,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), policy, factory);
@@ -9552,7 +10265,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), policy, factory);
@@ -9599,12 +10312,12 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let tiny = SessionRuntimeService::new(engine, root.path(), tiny_policy, factory);
         let err = tiny
-            .follow_up(session_id, ready.revision, "x".repeat(10_000))
+            .follow_up(session_id, ready.session_revision, "x".repeat(10_000))
             .await
             .unwrap_err();
         assert!(matches!(err, SessionRuntimeError::History(_)), "{err:?}");
@@ -9648,7 +10361,7 @@ mod tests {
         });
 
         let second = service
-            .follow_up(session_id, ready.revision, "second".into())
+            .follow_up(session_id, ready.session_revision, "second".into())
             .await
             .unwrap();
         assert_eq!(second.lifecycle, SessionLifecycle::Ready);
@@ -9685,7 +10398,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let error = service
-            .follow_up(session_id, ready.revision, "second".into())
+            .follow_up(session_id, ready.session_revision, "second".into())
             .await
             .unwrap_err();
         assert!(
@@ -9742,7 +10455,7 @@ mod tests {
             .await
             .unwrap();
         let waiting = service
-            .follow_up(session_id, ready.revision, "second".into())
+            .follow_up(session_id, ready.session_revision, "second".into())
             .await
             .unwrap();
         assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingInput);
@@ -9756,7 +10469,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let error = service
-            .follow_up(session_id, waiting.revision, "third".into())
+            .follow_up(session_id, waiting.session_revision, "third".into())
             .await
             .unwrap_err();
         assert!(
@@ -9794,7 +10507,7 @@ mod tests {
             .follow_up_accepted(
                 session_id,
                 SessionCommandId::from_uuid(Uuid::now_v7()),
-                ready.revision,
+                ready.session_revision,
                 "second".into(),
                 tx,
             )
@@ -9829,7 +10542,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), policy, factory);
@@ -9868,12 +10581,12 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let broken = SessionRuntimeService::new(engine, root.path(), invalid_policy, factory);
         let err = broken
-            .follow_up(session_id, ready.revision, "second".into())
+            .follow_up(session_id, ready.session_revision, "second".into())
             .await
             .unwrap_err();
         // Same defensive contract as start: the invalid policy fails at
@@ -9925,7 +10638,7 @@ mod tests {
             .acquire_session_lease(session_id, now_ms(), 60_000)
             .unwrap();
         let err = service
-            .switch_model(session_id, ready.revision, &next)
+            .switch_model(session_id, ready.session_revision, &next)
             .unwrap_err();
         assert!(matches!(err, SessionRuntimeError::Storage(_)), "{err:?}");
     }
@@ -9948,7 +10661,13 @@ mod tests {
             .await
             .unwrap();
         let err = service
-            .resolve_permission(ready.session_id, ready.revision, 0, "any".into(), true)
+            .resolve_permission(
+                ready.session_id,
+                ready.session_revision,
+                0,
+                "any".into(),
+                true,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, SessionRuntimeError::InvalidState));
@@ -9970,7 +10689,7 @@ mod tests {
         let err = service
             .cancel_durable(
                 session_id,
-                running.revision + 1,
+                running.session_revision + 1,
                 test_turn_revision(&running),
             )
             .unwrap_err();
@@ -9994,7 +10713,11 @@ mod tests {
             .acquire_session_lease(session_id, now_ms(), 60_000)
             .unwrap();
         let err = service
-            .cancel_durable(session_id, running.revision, test_turn_revision(&running))
+            .cancel_durable(
+                session_id,
+                running.session_revision,
+                test_turn_revision(&running),
+            )
             .unwrap_err();
         assert!(matches!(err, SessionRuntimeError::Storage(_)), "{err:?}");
     }
@@ -10022,7 +10745,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root, policy, factory);
@@ -10055,7 +10778,7 @@ mod tests {
         let err = service
             .provide_input(
                 session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 "lang".into(),
                 "x".repeat(10_000),
@@ -10092,7 +10815,7 @@ mod tests {
             } else {
                 Ok(ResolvedProvider {
                     provider: provider.clone(),
-                    binding: crate::registry::ProviderBinding::direct(&[]),
+                    binding: crate::registry::ProviderModelBinding::direct(&[]),
                 })
             }
         });
@@ -10115,7 +10838,7 @@ mod tests {
         let err = service
             .provide_input(
                 waiting.session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 "lang".into(),
                 "Rust".into(),
@@ -10155,7 +10878,7 @@ mod tests {
             } else {
                 Ok(ResolvedProvider {
                     provider: provider.clone(),
-                    binding: crate::registry::ProviderBinding::direct(&[]),
+                    binding: crate::registry::ProviderModelBinding::direct(&[]),
                 })
             }
         });
@@ -10182,7 +10905,7 @@ mod tests {
         let err = service
             .resolve_permission(
                 waiting.session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 request_id,
                 true,
@@ -10238,7 +10961,7 @@ mod tests {
         let err = service
             .resolve_permission(
                 waiting.session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 request_id,
                 true,
@@ -10316,7 +11039,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(
@@ -10404,7 +11127,6 @@ mod tests {
 
     #[test]
     fn finish_verification_without_active_run_fails() {
-        use latte_engine::SessionEffectPresentation;
         let root = tempfile::tempdir().unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
@@ -10422,8 +11144,8 @@ mod tests {
             Arc::new(|_| Err("unused".into())),
         );
         let lease = service.acquire(session_id).unwrap();
-        let presentation = SessionEffectPresentation {
-            effect_id: "e".into(),
+        let presentation = EffectView {
+            effect_id: "e".parse().unwrap(),
             tool_call_id: "t".into(),
             name: "process".into(),
             input: serde_json::json!({}),
@@ -10484,9 +11206,12 @@ mod tests {
                 created_at_ms: 2,
             },
         ];
-        let (sequence, calls, ordinal) = tool_round_for_call(&snapshot, "call-1").unwrap();
-        assert_eq!((sequence, ordinal), (2, 0));
-        assert_eq!(calls, vec![call]);
+        let position = tool_round_for_call(&snapshot, None, "call-1").unwrap();
+        assert_eq!(
+            (position.round.round_id, position.call_ordinal),
+            (RoundId::from_u64(2), 0)
+        );
+        assert_eq!(position.round.calls, vec![call]);
     }
 
     #[test]
@@ -10504,15 +11229,15 @@ mod tests {
         // Active run id set but the run is absent from the summary list.
         snapshot.active_turn_id = Some(turn_id);
         snapshot.turns = vec![];
-        let descriptor = SessionEffectDescriptor {
-            effect_id: "e".into(),
+        let descriptor = EffectAuthority {
+            effect_id: "e".parse().unwrap(),
             tool_call_id: "t".into(),
             name: "read_file".into(),
             input: serde_json::json!({}),
             attempt: 1,
         };
         assert!(session_effect_request(&snapshot, descriptor.clone(), "k".into()).is_err());
-        assert!(session_effect_start_request(&snapshot, "e".into(), "k".into()).is_err());
+        assert!(session_effect_start_request(&snapshot, "e".parse().unwrap(), "k".into()).is_err());
         // A snapshot without any active run also fails.
         snapshot.active_turn_id = None;
         assert!(session_effect_request(&snapshot, descriptor, "k".into()).is_err());
@@ -10605,7 +11330,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -10615,7 +11340,7 @@ mod tests {
             .start(session_id, "u".repeat(200), binding(), None)
             .await
             .unwrap()
-            .revision;
+            .session_revision;
         let usage = loop {
             let current = service.context_usage(session_id).unwrap();
             if current.proactive_compaction_due {
@@ -10625,7 +11350,7 @@ mod tests {
                 .follow_up(session_id, revision, "u".repeat(200))
                 .await
                 .unwrap()
-                .revision;
+                .session_revision;
         };
 
         assert_eq!(usage.request_budget_bytes, 5_599);
@@ -10705,7 +11430,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         // Same fill ratio, but the base policy leaves compaction Off.
@@ -10715,7 +11440,7 @@ mod tests {
             .start(session_id, "u".repeat(200), binding(), None)
             .await
             .unwrap()
-            .revision;
+            .session_revision;
         // Drive past the same 80% fill the enabled catalog arms at.
         for _ in 0..12 {
             let usage = service.context_usage(session_id).unwrap();
@@ -10726,7 +11451,7 @@ mod tests {
                 .follow_up(session_id, revision, "u".repeat(200))
                 .await
                 .unwrap()
-                .revision;
+                .session_revision;
         }
 
         let usage = service.context_usage(session_id).unwrap();
@@ -10767,7 +11492,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let tiny = SessionHistoryPolicy {
@@ -10814,7 +11539,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -10825,7 +11550,7 @@ mod tests {
             .await
             .unwrap();
         let snapshot = service
-            .follow_up(session_id, ready.revision, "second".into())
+            .follow_up(session_id, ready.session_revision, "second".into())
             .await
             .unwrap();
 
@@ -10896,7 +11621,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         // No profile catalog: the base policy keeps compaction disabled —
@@ -10908,7 +11633,7 @@ mod tests {
             .await
             .unwrap();
         let snapshot = service
-            .follow_up(session_id, ready.revision, "second".into())
+            .follow_up(session_id, ready.session_revision, "second".into())
             .await
             .unwrap();
         assert_eq!(
@@ -10942,7 +11667,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -10953,7 +11678,7 @@ mod tests {
             .await
             .unwrap();
         let snapshot = service
-            .follow_up(session_id, ready.revision, "second".into())
+            .follow_up(session_id, ready.session_revision, "second".into())
             .await
             .unwrap();
         assert_eq!(
@@ -10997,7 +11722,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -11008,7 +11733,7 @@ mod tests {
             .await
             .unwrap();
         let snapshot = service
-            .follow_up(session_id, ready.revision, "second".into())
+            .follow_up(session_id, ready.session_revision, "second".into())
             .await
             .unwrap();
         assert!(
@@ -11043,6 +11768,7 @@ mod tests {
             from_summary: false,
             turn_id: None,
             tool_results: Vec::new(),
+            assistant_rounds: Vec::new(),
         };
         // Four ~700-byte history segments plus the prospective prompt tail;
         // 20% of the 10_000 budget keeps the two newest movable segments.
@@ -11095,7 +11821,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -11106,14 +11832,14 @@ mod tests {
             .start(session_id, turn_prompt(1), binding(), None)
             .await
             .unwrap()
-            .revision;
+            .session_revision;
         let mut index = 2;
         loop {
             revision = service
                 .follow_up(session_id, revision, turn_prompt(index))
                 .await
                 .unwrap()
-                .revision;
+                .session_revision;
             let requests = provider.requests.lock().unwrap();
             if requests.iter().any(|messages| {
                 matches!(
@@ -11218,7 +11944,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -11236,13 +11962,13 @@ mod tests {
         let second = service
             .follow_up(
                 session_id,
-                first.revision,
+                first.session_revision,
                 format!("SECOND-{}", "y".repeat(900)),
             )
             .await
             .unwrap();
         let _third = service
-            .follow_up(session_id, second.revision, "THIRD-PROMPT".into())
+            .follow_up(session_id, second.session_revision, "THIRD-PROMPT".into())
             .await
             .unwrap();
         let requests = provider.requests.lock().unwrap().clone();
@@ -11323,7 +12049,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -11334,7 +12060,11 @@ mod tests {
             .await
             .unwrap();
         let done = service
-            .follow_up(session_id, first.revision, "read the big file".into())
+            .follow_up(
+                session_id,
+                first.session_revision,
+                "read the big file".into(),
+            )
             .await
             .unwrap();
         assert_eq!(done.lifecycle, SessionLifecycle::Ready);
@@ -11428,7 +12158,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -11438,13 +12168,13 @@ mod tests {
             .start(session_id, "x".repeat(3_000), binding(), None)
             .await
             .unwrap()
-            .revision;
+            .session_revision;
         for index in 0..4 {
             revision = service
                 .follow_up(session_id, revision, format!("next-{index}").repeat(300))
                 .await
                 .unwrap()
-                .revision;
+                .session_revision;
         }
         let requests = provider.requests.lock().unwrap().clone();
         let summaries = requests
@@ -11517,7 +12247,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -11527,7 +12257,7 @@ mod tests {
             .start(session_id, "x".repeat(3_000), binding(), None)
             .await
             .unwrap()
-            .revision;
+            .session_revision;
         for (label, summaries_fail) in [
             ("fail-1", true),
             ("fail-2", true),
@@ -11546,7 +12276,7 @@ mod tests {
                 )
                 .await
                 .unwrap()
-                .revision;
+                .session_revision;
         }
         let requests = provider.requests.lock().unwrap().clone();
         let summaries = requests
@@ -11583,6 +12313,8 @@ mod tests {
                     },
                     Message::Assistant {
                         content: None,
+                        reasoning_content: None,
+                        thinking_blocks: vec![],
                         tool_calls: vec![crate::provider::ToolCall {
                             id: id.into(),
                             name: name.into(),
@@ -11663,7 +12395,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -11674,7 +12406,7 @@ mod tests {
             .await
             .unwrap();
         let done = service
-            .follow_up(session_id, first.revision, "s".repeat(1_000))
+            .follow_up(session_id, first.session_revision, "s".repeat(1_000))
             .await
             .unwrap();
         assert_eq!(done.lifecycle, SessionLifecycle::Ready);
@@ -11742,7 +12474,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -11753,7 +12485,7 @@ mod tests {
             .await
             .unwrap();
         let done = service
-            .follow_up(session_id, first.revision, "second".into())
+            .follow_up(session_id, first.session_revision, "second".into())
             .await
             .unwrap();
         let requests = provider.requests.lock().unwrap().clone();
@@ -11800,7 +12532,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -11811,7 +12543,7 @@ mod tests {
             .await
             .unwrap();
         let done = service
-            .follow_up(session_id, first.revision, "s".repeat(400))
+            .follow_up(session_id, first.session_revision, "s".repeat(400))
             .await
             .unwrap();
         assert_eq!(done.lifecycle, SessionLifecycle::Ready);
@@ -11861,7 +12593,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -11872,7 +12604,7 @@ mod tests {
             .await
             .unwrap();
         let done = service
-            .follow_up(session_id, first.revision, "s".repeat(400))
+            .follow_up(session_id, first.session_revision, "s".repeat(400))
             .await
             .unwrap();
         // The exhausted failure is retryable: the active child ends while
@@ -11923,7 +12655,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -11958,7 +12690,11 @@ mod tests {
             "the reminder is genuinely large, not vacuous"
         );
         let done = service
-            .follow_up(session_id, first.revision, near_budget_prompt.clone())
+            .follow_up(
+                session_id,
+                first.session_revision,
+                near_budget_prompt.clone(),
+            )
             .await
             .unwrap();
         assert_eq!(done.lifecycle, SessionLifecycle::Ready);
@@ -12007,7 +12743,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -12069,7 +12805,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -12080,11 +12816,11 @@ mod tests {
             .await
             .unwrap();
         let second = service
-            .follow_up(session_id, first.revision, "v".repeat(100))
+            .follow_up(session_id, first.session_revision, "v".repeat(100))
             .await
             .unwrap();
         let done = service
-            .follow_up(session_id, second.revision, "w".repeat(100))
+            .follow_up(session_id, second.session_revision, "w".repeat(100))
             .await
             .unwrap();
         assert_eq!(done.lifecycle, SessionLifecycle::Ready);
@@ -12164,7 +12900,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -12180,11 +12916,15 @@ mod tests {
         // Turn 2 parks mid-flight at the write-permission gate, giving a
         // snapshot with an active turn without an owned runner lease.
         let parked = service
-            .follow_up(session_id, ready.revision, "second turn please".into())
+            .follow_up(
+                session_id,
+                ready.session_revision,
+                "second turn please".into(),
+            )
             .await
             .unwrap();
         assert_eq!(parked.lifecycle, SessionLifecycle::WaitingPermission);
-        let revision_before = parked.revision;
+        let revision_before = parked.session_revision;
 
         let lease = service.acquire(session_id).unwrap();
         // The provider rejected a request that had already shed the older
@@ -12210,7 +12950,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            post.revision, revision_before,
+            post.session_revision, revision_before,
             "a within-budget but non-shrinking forced elision must not commit/retry"
         );
         assert_eq!(
@@ -12267,7 +13007,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         // Pure SummarizeOnDiscard: no deterministic elision tier in the path.
@@ -12279,11 +13019,11 @@ mod tests {
             .await
             .unwrap();
         let second = service
-            .follow_up(session_id, first.revision, "v".repeat(100))
+            .follow_up(session_id, first.session_revision, "v".repeat(100))
             .await
             .unwrap();
         let done = service
-            .follow_up(session_id, second.revision, "w".repeat(100))
+            .follow_up(session_id, second.session_revision, "w".repeat(100))
             .await
             .unwrap();
         assert_eq!(done.lifecycle, SessionLifecycle::Ready);
@@ -12333,7 +13073,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -12350,6 +13090,8 @@ mod tests {
             vec![
                 Message::Assistant {
                     content: None,
+                    reasoning_content: None,
+                    thinking_blocks: vec![],
                     tool_calls: vec![crate::provider::ToolCall {
                         id: "c1".into(),
                         name: "read_file".into(),
@@ -12447,7 +13189,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service =
@@ -12460,7 +13202,7 @@ mod tests {
             .await
             .unwrap();
         service
-            .follow_up(session_id, first.revision, "v".repeat(100))
+            .follow_up(session_id, first.session_revision, "v".repeat(100))
             .await
             .unwrap();
 
@@ -12529,7 +13271,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service =
@@ -12542,7 +13284,7 @@ mod tests {
             .await
             .unwrap();
         service
-            .follow_up(session_id, first.revision, "v".repeat(100))
+            .follow_up(session_id, first.session_revision, "v".repeat(100))
             .await
             .unwrap();
 
@@ -12627,7 +13369,7 @@ mod tests {
             VecDeque::from(["queued while parked".to_owned()]),
         );
         let mut stale = ready.clone();
-        stale.revision = ready.revision.wrapping_sub(1);
+        stale.session_revision = ready.session_revision.wrapping_sub(1);
         let runner = service.ensure_runner(session_id);
         let outcome = service.drain_mailbox(stale, runner).await;
         assert!(
@@ -12639,7 +13381,7 @@ mod tests {
             "the open guard's Drop must reclaim the entry on the escape"
         );
         let next = service
-            .follow_up(session_id, ready.revision, "after failure".into())
+            .follow_up(session_id, ready.session_revision, "after failure".into())
             .await
             .unwrap();
         assert_eq!(next.lifecycle, SessionLifecycle::Ready);
@@ -12671,7 +13413,7 @@ mod tests {
             VecDeque::from(["queued while parked".to_owned()]),
         );
         let mut stale = ready.clone();
-        stale.revision = ready.revision.wrapping_sub(1);
+        stale.session_revision = ready.session_revision.wrapping_sub(1);
         let mut runner = service.ensure_runner(session_id);
         runner.mark_closed();
         let outcome = service.drain_mailbox(stale, runner).await;
@@ -12719,7 +13461,7 @@ mod tests {
             .await
             .unwrap();
         let waiting = service
-            .follow_up(session_id, ready.revision, "second".into())
+            .follow_up(session_id, ready.session_revision, "second".into())
             .await
             .unwrap();
         assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingInput);
@@ -12731,7 +13473,7 @@ mod tests {
         let done = service
             .provide_input(
                 session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 "shape".into(),
                 "the answer".into(),
@@ -12786,14 +13528,18 @@ mod tests {
             .await
             .unwrap();
         let waiting = service
-            .follow_up(session_id, ready.revision, "second".into())
+            .follow_up(session_id, ready.session_revision, "second".into())
             .await
             .unwrap();
         service
             .queue_follow_up(session_id, "queued while parked".into())
             .unwrap();
         let cancelled = service
-            .cancel_durable(session_id, waiting.revision, test_turn_revision(&waiting))
+            .cancel_durable(
+                session_id,
+                waiting.session_revision,
+                test_turn_revision(&waiting),
+            )
             .unwrap();
         assert_eq!(cancelled.lifecycle, SessionLifecycle::Failed);
         assert!(
@@ -12861,7 +13607,7 @@ mod tests {
             .await
             .unwrap();
         let waiting = service
-            .follow_up(session_id, ready.revision, "second".into())
+            .follow_up(session_id, ready.session_revision, "second".into())
             .await
             .unwrap();
         service
@@ -12870,7 +13616,7 @@ mod tests {
         let failed = service
             .provide_input(
                 session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 "shape".into(),
                 "the answer".into(),
@@ -12946,7 +13692,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn reconciliation_drain_keeps_the_parked_queue_untouched() {
+        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
+        let ro_dir = root.path().join("readonly_dir");
+        std::fs::create_dir(&ro_dir).unwrap();
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
             .build()
@@ -12956,11 +13706,15 @@ mod tests {
             engine,
             vec![
                 response(
-                    Some("attempting failed process"),
+                    Some("attempting uncertain write"),
                     vec![crate::provider::ToolCall {
-                        id: "failed-process".into(),
-                        name: "process".into(),
-                        input: serde_json::json!({"argv":["/definitely-missing-latte-command"]}),
+                        id: "uncertain-write".into(),
+                        name: "write_file".into(),
+                        input: serde_json::json!({
+                            "path": "readonly_dir/out.txt",
+                            "content": "x",
+                            "create_intent": true,
+                        }),
                     }],
                 ),
                 response(Some("must not be reached"), vec![]),
@@ -12983,7 +13737,7 @@ mod tests {
         let terminal = service
             .resolve_permission(
                 session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 request_id,
                 true,
@@ -13016,7 +13770,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn reconciling_to_failed_discards_and_audits_the_parked_queue() {
+        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
+        let ro_dir = root.path().join("readonly_dir");
+        std::fs::create_dir(&ro_dir).unwrap();
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let engine = EngineBuilder::new()
             .workspace_root(root.path())
             .build()
@@ -13026,11 +13784,15 @@ mod tests {
             engine,
             vec![
                 response(
-                    Some("attempting failed process"),
+                    Some("attempting uncertain write"),
                     vec![crate::provider::ToolCall {
-                        id: "failed-process".into(),
-                        name: "process".into(),
-                        input: serde_json::json!({"argv":["/definitely-missing-latte-command"]}),
+                        id: "uncertain-write".into(),
+                        name: "write_file".into(),
+                        input: serde_json::json!({
+                            "path": "readonly_dir/out.txt",
+                            "content": "x",
+                            "create_intent": true,
+                        }),
                     }],
                 ),
                 response(Some("must not be reached"), vec![]),
@@ -13052,7 +13814,7 @@ mod tests {
         let terminal = service
             .resolve_permission(
                 session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 request_id,
                 true,
@@ -13144,7 +13906,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -13155,7 +13917,7 @@ mod tests {
             .await
             .unwrap();
         let waiting = service
-            .follow_up(session_id, ready.revision, "second".into())
+            .follow_up(session_id, ready.session_revision, "second".into())
             .await
             .unwrap();
         assert_eq!(waiting.lifecycle, SessionLifecycle::WaitingInput);
@@ -13163,7 +13925,7 @@ mod tests {
         let completed = service
             .provide_input(
                 session_id,
-                waiting.revision,
+                waiting.session_revision,
                 test_turn_revision(&waiting),
                 "shape".into(),
                 "y".repeat(2_000),
@@ -13232,7 +13994,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -13243,11 +14005,11 @@ mod tests {
             .await
             .unwrap();
         let second = service
-            .follow_up(session_id, ready.revision, "second".into())
+            .follow_up(session_id, ready.session_revision, "second".into())
             .await
             .unwrap();
         service
-            .follow_up(session_id, second.revision, "third".into())
+            .follow_up(session_id, second.session_revision, "third".into())
             .await
             .unwrap();
         let requests = provider.requests.lock().unwrap().clone();
@@ -13415,7 +14177,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -13431,7 +14193,7 @@ mod tests {
             .await
             .unwrap();
         let ready = service
-            .follow_up(session_id, first.revision, "MANUAL-T2".into())
+            .follow_up(session_id, first.session_revision, "MANUAL-T2".into())
             .await
             .unwrap();
         assert_eq!(ready.lifecycle, SessionLifecycle::Ready);
@@ -13446,7 +14208,7 @@ mod tests {
             result.state,
             latte_core::ManualCompactionState::Compacted {
                 tier: latte_core::ManualCompactionTier::Summarized,
-                revision: ready.revision + 1,
+                session_revision: ready.session_revision + 1,
             }
         );
         let card = result
@@ -13484,7 +14246,11 @@ mod tests {
         // The card is a normal compaction boundary: the next turn replays
         // summary + retained suffix and never the superseded first turn.
         let third = service
-            .follow_up(session_id, result.snapshot.revision, "MANUAL-T3".into())
+            .follow_up(
+                session_id,
+                result.snapshot.session_revision,
+                "MANUAL-T3".into(),
+            )
             .await
             .unwrap();
         assert_eq!(third.lifecycle, SessionLifecycle::Ready);
@@ -13521,7 +14287,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -13537,7 +14303,11 @@ mod tests {
             .await
             .unwrap();
         let ready = service
-            .follow_up(session_id, first.revision, "REPEAT-MANUAL-T2".into())
+            .follow_up(
+                session_id,
+                first.session_revision,
+                "REPEAT-MANUAL-T2".into(),
+            )
             .await
             .unwrap();
         assert_eq!(ready.lifecycle, SessionLifecycle::Ready);
@@ -13546,11 +14316,11 @@ mod tests {
         let compacted_revision = match compacted.state {
             latte_core::ManualCompactionState::Compacted {
                 tier: latte_core::ManualCompactionTier::Summarized,
-                revision,
-            } => revision,
+                session_revision,
+            } => session_revision,
             other => panic!("first manual compact must summarize, got {other:?}"),
         };
-        assert_eq!(compacted_revision, ready.revision + 1);
+        assert_eq!(compacted_revision, ready.session_revision + 1);
         assert_eq!(
             provider.requests.lock().unwrap().len(),
             3,
@@ -13567,7 +14337,7 @@ mod tests {
                 "repeating compact on the same floor is the documented empty-state"
             );
             assert_eq!(
-                again.snapshot.revision, compacted_revision,
+                again.snapshot.session_revision, compacted_revision,
                 "the idle repeat must not advance the revision"
             );
         }
@@ -13615,7 +14385,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -13632,7 +14402,7 @@ mod tests {
                 reason: latte_core::ManualCompactionIdleReason::NothingToCompress
             }
         );
-        assert_eq!(result.snapshot.revision, ready.revision);
+        assert_eq!(result.snapshot.session_revision, ready.session_revision);
         assert_eq!(
             provider.requests.lock().unwrap().len(),
             1,
@@ -13657,7 +14427,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let off_catalog = Arc::new(ProfileCatalog::without_registry(ContextPolicy {
@@ -13678,7 +14448,7 @@ mod tests {
             .await
             .unwrap();
         service
-            .follow_up(session_id, first.revision, "y".repeat(700))
+            .follow_up(session_id, first.session_revision, "y".repeat(700))
             .await
             .unwrap();
         let result = service.compact_session(session_id).await.unwrap();
@@ -13730,7 +14500,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -13741,7 +14511,7 @@ mod tests {
             .await
             .unwrap();
         service
-            .follow_up(session_id, first.revision, "y".repeat(700))
+            .follow_up(session_id, first.session_revision, "y".repeat(700))
             .await
             .unwrap();
         service
@@ -13785,7 +14555,7 @@ mod tests {
         let factory: SessionProviderFactory = Arc::new(move |_| {
             Ok(ResolvedProvider {
                 provider: factory_provider.clone(),
-                binding: crate::registry::ProviderBinding::direct(&[]),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
             })
         });
         let service = SessionRuntimeService::new(engine, root.path(), tight_policy(), factory)
@@ -13796,7 +14566,7 @@ mod tests {
             .await
             .unwrap();
         let ready = service
-            .follow_up(session_id, first.revision, "second".into())
+            .follow_up(session_id, first.session_revision, "second".into())
             .await
             .unwrap();
         assert_eq!(ready.lifecycle, SessionLifecycle::Ready);
@@ -13807,7 +14577,7 @@ mod tests {
             result.state,
             latte_core::ManualCompactionState::Compacted {
                 tier: latte_core::ManualCompactionTier::Elided,
-                revision: ready.revision + 1,
+                session_revision: ready.session_revision + 1,
             }
         );
         let card = result
@@ -14037,6 +14807,8 @@ mod tests {
                     },
                     Message::Assistant {
                         content: Some("old answer".into()),
+                        reasoning_content: None,
+                        thinking_blocks: vec![],
                         tool_calls: vec![],
                     },
                 ],
@@ -14075,17 +14847,18 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // Old durable history, then both volatile tails, then the open turn
-        // verbatim — and the tails sit nowhere else in the shape.
+        // `<repository-context>` is head-anchored right under `system` ahead of
+        // old history, while `<system-reminder>` sits immediately before the
+        // open turn's prompt.
         assert_eq!(texts.len(), 4);
-        assert_eq!(texts[0], "old prompt");
-        assert!(texts[1].contains("REPO-SNAPSHOT-MARKER"));
+        assert!(texts[0].starts_with("<repository-context>"));
+        assert!(texts[0].contains("REPO-SNAPSHOT-MARKER"));
+        assert_eq!(texts[1], "old prompt");
+        assert!(texts[2].starts_with("<system-reminder>"));
         assert!(texts[2].contains("REMINDER-MARKER"));
         assert_eq!(texts[3], "active prompt");
-        assert!(texts[1].starts_with("<repository-context>"));
-        assert!(texts[2].starts_with("<system-reminder>"));
         // A summary, when present, stays directly under the head and ahead of
-        // every durable segment.
+        // `<repository-context>` and every durable segment.
         let summarized = SessionRuntimeService::assemble_mid_turn_request(
             &system,
             Some("SUMMARY-MARKER"),
@@ -14095,6 +14868,9 @@ mod tests {
         );
         assert!(
             matches!(&summarized[1], Message::User { content } if content.contains("SUMMARY-MARKER"))
+        );
+        assert!(
+            matches!(&summarized[2], Message::User { content } if content.starts_with("<repository-context>"))
         );
     }
 
@@ -14143,7 +14919,7 @@ mod tests {
 
         // The armed reminder is consumed by the next turn and redacted in the
         // wire request.
-        let revision = ready.revision;
+        let revision = ready.session_revision;
         service
             .follow_up(session_id, revision, "second-prompt".into())
             .await
@@ -14236,7 +15012,7 @@ mod tests {
             .start(session_id, "first-prompt".into(), binding(), None)
             .await
             .unwrap()
-            .revision;
+            .session_revision;
 
         service
             .set_reminder(session_id, "REMINDER-ONESHOT-MARKER")
@@ -14245,7 +15021,7 @@ mod tests {
             .follow_up(session_id, revision, "second-prompt".into())
             .await
             .unwrap()
-            .revision;
+            .session_revision;
         // The next turn carries no reminder: the slot is one-shot.
         service
             .follow_up(session_id, revision, "third-prompt".into())
@@ -14285,6 +15061,7 @@ mod tests {
         let provider = Arc::new(RecordingProvider::scripted([
             response(Some("first"), vec![]),
             response(Some("second"), vec![]),
+            response(Some("third"), vec![]),
         ]));
         let service = recording_service(root.path(), engine, Arc::clone(&provider));
         let session_id = SessionId::from_uuid(Uuid::now_v7());
@@ -14292,17 +15069,22 @@ mod tests {
             .start(session_id, "FIRST-PROMPT-MARKER".into(), binding(), None)
             .await
             .unwrap()
-            .revision;
+            .session_revision;
 
-        // The workspace file changes between turns; durable history already
-        // contains the first prompt.
+        // The workspace file changes between turn 1 and turn 2.
         std::fs::write(&agents, "# workspace\nREPO-MARKER-V2-BRAVO\n").unwrap();
         revision = service
             .follow_up(session_id, revision, "SECOND-PROMPT-MARKER".into())
             .await
             .unwrap()
-            .revision;
-        let _ = revision;
+            .session_revision;
+
+        // Between turn 2 and turn 3, AGENTS.md is unchanged: turn 3 must be a
+        // strict prefix extension of turn 2 so provider KV cache hits 100%.
+        let _ = service
+            .follow_up(session_id, revision, "THIRD-PROMPT-MARKER".into())
+            .await
+            .unwrap();
 
         let requests = provider.requests.lock().unwrap().clone();
         let head_1 = match &requests[0][0] {
@@ -14317,40 +15099,23 @@ mod tests {
         assert!(!head_1.contains("REPO-MARKER"));
         assert!(!head_1.contains("FIRST-PROMPT-MARKER"));
 
-        // Each turn's repository snapshot rides a volatile user tail, never
-        // the head; turn 1 sees V1, turn 2 sees the edited V2.
         let wire_1 = joined(&requests[0]);
         let wire_2 = joined(&requests[1]);
         assert!(wire_1.contains("REPO-MARKER-V1-ALPHA"));
         assert!(!wire_1.contains("REPO-MARKER-V2-BRAVO"));
         assert!(wire_2.contains("REPO-MARKER-V2-BRAVO"));
-        // Tails are framed and sit immediately ahead of their turn's prompt.
-        let tail_at_1 = requests[0]
-            .iter()
-            .position(|message| {
-                matches!(message, Message::User { content } if content.starts_with("<repository-context>"))
-            })
-            .unwrap();
-        let prompt_at_1 = requests[0]
-            .iter()
-            .position(|message| {
-                matches!(message, Message::User { content } if content == "FIRST-PROMPT-MARKER")
-            })
-            .unwrap();
-        assert_eq!(tail_at_1 + 1, prompt_at_1);
-        let tail_at_2 = requests[1]
-            .iter()
-            .position(|message| {
-                matches!(message, Message::User { content } if content.starts_with("<repository-context>"))
-            })
-            .unwrap();
-        let prompt_at_2 = requests[1]
-            .iter()
-            .position(|message| {
-                matches!(message, Message::User { content } if content == "SECOND-PROMPT-MARKER")
-            })
-            .unwrap();
-        assert_eq!(tail_at_2 + 1, prompt_at_2);
+        // `<repository-context>` is head-anchored at index 1 right under `system`.
+        assert!(
+            matches!(&requests[0][1], Message::User { content } if content.starts_with("<repository-context>"))
+        );
+        assert!(
+            matches!(&requests[1][1], Message::User { content } if content.starts_with("<repository-context>"))
+        );
+        assert_eq!(
+            &requests[2][..requests[1].len()],
+            &requests[1][..],
+            "unchanged workspace docs keep turn 2 an exact message prefix of turn 3"
+        );
         // The volatile snapshot is non-persistent: durable transcript keeps
         // prompts but never the framed workspace contents.
         let snapshot = service.load_full(session_id).unwrap();
@@ -14358,5 +15123,978 @@ mod tests {
         assert!(!transcript.contains("repository-context"));
         assert!(!transcript.contains("REPO-MARKER-V1-ALPHA"));
         assert!(!transcript.contains("REPO-MARKER-V2-BRAVO"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn round_id_disambiguates_reused_tool_call_id_across_rounds_and_certified_error_feeds_provider()
+     {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("alpha.txt"), "ALPHA-CONTENT").unwrap();
+        std::fs::write(root.path().join("bravo.txt"), "BRAVO-CONTENT").unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(RecordingProvider::scripted([
+            // Round 1: call_id "call-dup" reads alpha.txt, plus a second call in the same batch.
+            response(
+                None,
+                vec![
+                    read_call("call-dup", "alpha.txt"),
+                    read_call("call-extra", "bravo.txt"),
+                ],
+            ),
+            // Round 2: provider reuses call_id "call-dup" for an Ask write_file, followed by read_file("bravo.txt").
+            response(
+                None,
+                vec![
+                    crate::provider::ToolCall {
+                        id: "call-dup".into(),
+                        name: "write_file".into(),
+                        input: serde_json::json!({
+                            "path": "created.txt",
+                            "content": "NEW-FILE",
+                            "create_intent": true,
+                        }),
+                    },
+                    read_call("call-tail", "bravo.txt"),
+                ],
+            ),
+            // Round 3: non-fatal observed tool error (invalid regex in `search`, cross-platform).
+            response(
+                None,
+                vec![crate::provider::ToolCall {
+                    id: "call-tool-err".into(),
+                    name: "search".into(),
+                    input: serde_json::json!({"query": "[", "regex": true}),
+                }],
+            ),
+            // Final assistant response after observing tool error + call-tail result.
+            response(Some("handled reused call id and certified error"), vec![]),
+        ]));
+        let factory_provider = Arc::clone(&provider);
+        let factory: SessionProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: factory_provider.clone(),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
+            })
+        });
+        let service = SessionRuntimeService::new(
+            engine,
+            root.path(),
+            SessionHistoryPolicy::default(),
+            factory,
+        );
+
+        let session_id = SessionId::from_uuid(Uuid::now_v7());
+        let parked = service
+            .start(
+                session_id,
+                "test reused tool call id".into(),
+                binding(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(parked.lifecycle, SessionLifecycle::WaitingPermission);
+        let request_id = match parked.pending.as_ref().unwrap() {
+            latte_core::SessionPendingRequest::Permission { request_id, .. } => request_id.clone(),
+            other @ latte_core::SessionPendingRequest::Input { .. } => {
+                panic!("expected permission request, got {other:?}")
+            }
+        };
+        let effect_kind = EffectId::new(&request_id).unwrap().parse_session().unwrap();
+        assert!(matches!(
+            effect_kind,
+            SessionEffectKind::ToolCall {
+                call_ordinal: 0,
+                ..
+            }
+        ));
+
+        // Approving round 2's "call-dup" must resume round 2 (running "call-tail"), then round 3,
+        // and complete cleanly on every OS when verification is not configured.
+        let completed = service
+            .resolve_permission(
+                session_id,
+                parked.session_revision,
+                test_turn_revision(&parked),
+                request_id,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.lifecycle, SessionLifecycle::Ready);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("created.txt")).unwrap(),
+            "NEW-FILE"
+        );
+        // Verify Assistant tool-round cards persisted explicit round_id and tool error + call-tail reached provider.
+        let assistant_rounds: Vec<_> = completed
+            .transcript
+            .entries
+            .iter()
+            .filter(|e| {
+                e.kind == TranscriptKind::Assistant
+                    && e.payload.as_ref().and_then(|p| p.get("round_id")).is_some()
+            })
+            .collect();
+        assert_eq!(assistant_rounds.len(), 3);
+        let requests = provider.requests.lock().unwrap().clone();
+        let final_req = requests.last().unwrap();
+        let dup_results: Vec<&str> = final_req
+            .iter()
+            .filter_map(|msg| match msg {
+                Message::Tool {
+                    tool_call_id,
+                    content,
+                    ..
+                } if tool_call_id == "call-dup" => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dup_results.len(),
+            2,
+            "both rounds' reused `call-dup` tool results must be replayed in provider history: {final_req:?}"
+        );
+        assert!(dup_results[0].contains("ALPHA-CONTENT"), "{dup_results:?}");
+        assert!(dup_results[1].contains("\"size\":8"), "{dup_results:?}");
+        let last_request = serde_json::to_string(final_req).unwrap();
+        assert!(
+            last_request.contains("call-tail")
+                && last_request.contains("call-tool-err")
+                && last_request.contains("error"),
+            "observed tool error and remaining round-2 call must reach the next provider request: {last_request}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn mid_turn_cold_prefix_compaction_and_lease_loss_recovery_boundaries() {
+        use crate::{
+            profile::ProfileCatalog,
+            provider::{ProviderUsage, ToolCall},
+            registry::ProviderRegistry,
+        };
+        use latte_core::{
+            CompactionPolicy, CompactionStrategy, ContextPolicy, IdSource, PermissionMode,
+            SystemIdSource,
+        };
+        use std::collections::VecDeque;
+
+        struct SeqProv(Arc<std::sync::Mutex<VecDeque<Result<ProviderResponse, ProviderError>>>>);
+        impl Provider for SeqProv {
+            fn complete(
+                &self,
+                _req: ProviderRequest,
+                _ctx: ProviderContext,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<ProviderResponse, ProviderError>>
+                        + Send,
+                >,
+            > {
+                let res = self.0.lock().unwrap().pop_front().unwrap();
+                Box::pin(async move { res })
+            }
+        }
+
+        struct LeaseStealProv {
+            engine: EngineHandle,
+            session_id: SessionId,
+        }
+        impl Provider for LeaseStealProv {
+            fn complete(
+                &self,
+                _req: ProviderRequest,
+                _ctx: ProviderContext,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<ProviderResponse, ProviderError>>
+                        + Send,
+                >,
+            > {
+                let engine = self.engine.clone();
+                let sid = self.session_id;
+                Box::pin(async move {
+                    let _ = engine.acquire_session_lease(sid, u64::MAX / 4, 60_000);
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    Ok(ProviderResponse {
+                        message: Some("late".into()),
+                        tool_calls: vec![],
+                        input_request: None,
+                        usage: ProviderUsage::default(),
+                        finish_reason: None,
+                        provider_state: None,
+                    })
+                })
+            }
+        }
+
+        let mid_ws = tempfile::tempdir().unwrap();
+        std::fs::write(mid_ws.path().join("big.txt"), "X".repeat(3_600)).unwrap();
+        let mid_engine = EngineBuilder::new()
+            .workspace_root(mid_ws.path())
+            .permission_mode(PermissionMode::FullAuto)
+            .build()
+            .unwrap();
+        let mid_desc = mid_engine.tool_descriptors();
+        let mid_reg = Arc::new(
+            ProviderRegistry::parse_jsonc(
+                r#"{version:1,default_model:"oai/m",providers:{oai:{type:"openai-chat",models:["m"],endpoint:"http://127.0.0.1:9/v1/chat/completions",api_key:"k"}}}"#,
+            )
+            .unwrap(),
+        );
+        let mid_binding = mid_reg.session_binding_for_default(&mid_desc).unwrap();
+        let mid_policy = SessionHistoryPolicy {
+            max_request_bytes: 9_216,
+            max_input_bytes: 9_216,
+            reserved_output_bytes: 512,
+            context_cap_bytes: 1_024,
+            provider_timeout_ms: 2_000,
+            max_tool_rounds: Some(8),
+        };
+        let mid_compaction = CompactionPolicy {
+            strategy: CompactionStrategy::ElideToolResultsThenSummarize,
+            max_summary_source_bytes: 16_384,
+            trigger_ratio: 45,
+            retain_ratio: 1,
+            reuse_prefix: false,
+            ..CompactionPolicy::default()
+        };
+        let mid_cat = Arc::new(
+            ProfileCatalog::new(
+                ContextPolicy {
+                    max_request_bytes: 9_216,
+                    max_input_bytes: 9_216,
+                    reserved_output_bytes: 512,
+                    context_cap_bytes: 1_024,
+                    max_tool_rounds: Some(8),
+                    provider_timeout_ms: 2_000,
+                    compaction: mid_compaction,
+                    ..ContextPolicy::default()
+                },
+                Arc::clone(&mid_reg),
+            )
+            .unwrap(),
+        );
+
+        let calls = Arc::new(std::sync::Mutex::new(VecDeque::from([
+            Ok(ProviderResponse {
+                message: None,
+                tool_calls: vec![ToolCall {
+                    id: "t1-l".into(),
+                    name: "list_directory".into(),
+                    input: serde_json::json!({"path": "."}),
+                }],
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            }),
+            Ok(ProviderResponse {
+                message: Some("A".repeat(1_800)),
+                tool_calls: vec![],
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            }),
+            Ok(ProviderResponse {
+                message: None,
+                tool_calls: vec![ToolCall {
+                    id: "t2-r".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "big.txt"}),
+                }],
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            }),
+            Err(ProviderError::Transport(
+                "mid-turn summary transient".into(),
+            )),
+            Ok(ProviderResponse {
+                message: None,
+                tool_calls: vec![ToolCall {
+                    id: "t2-l2".into(),
+                    name: "list_directory".into(),
+                    input: serde_json::json!({"path": "."}),
+                }],
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            }),
+            Ok(ProviderResponse {
+                message: Some("cold-prefix mid-turn summary".into()),
+                tool_calls: vec![],
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            }),
+            Ok(ProviderResponse {
+                message: Some("turn2 done".into()),
+                tool_calls: vec![],
+                input_request: None,
+                usage: ProviderUsage::default(),
+                finish_reason: None,
+                provider_state: None,
+            }),
+        ])));
+        let seq_prov: Arc<dyn Provider> = Arc::new(SeqProv(calls));
+        let reg_for_mid = Arc::clone(&mid_reg);
+        let desc_for_mid = mid_desc.clone();
+        let mid_svc = SessionRuntimeService::new(
+            mid_engine.clone(),
+            mid_ws.path(),
+            mid_policy,
+            Arc::new(move |sel| {
+                let res = reg_for_mid
+                    .resolve_session_bound(sel, &desc_for_mid)
+                    .map_err(|e| e.to_string())?;
+                Ok(ResolvedProvider {
+                    provider: Arc::clone(&seq_prov),
+                    binding: res.binding,
+                })
+            }),
+        )
+        .with_profile_catalog(mid_cat);
+
+        let m_sid = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let s1 = mid_svc
+            .start(m_sid, "seed history".into(), mid_binding.clone(), None)
+            .await
+            .unwrap();
+        let s2 = mid_svc
+            .follow_up(
+                m_sid,
+                s1.session_revision,
+                "trigger mid-turn summarize".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(s2.lifecycle, SessionLifecycle::Ready);
+        assert!(
+            s2.transcript
+                .entries
+                .iter()
+                .any(|e| e.kind == TranscriptKind::CompactSummary)
+        );
+
+        let steal_sid = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
+        let steal_prov: Arc<dyn Provider> = Arc::new(LeaseStealProv {
+            engine: mid_engine.clone(),
+            session_id: steal_sid,
+        });
+        let reg_for_steal = Arc::clone(&mid_reg);
+        let steal_svc = SessionRuntimeService::new(
+            mid_engine,
+            mid_ws.path(),
+            SessionHistoryPolicy::default(),
+            Arc::new(move |sel| {
+                let res = reg_for_steal
+                    .resolve_session_bound(sel, &mid_desc)
+                    .map_err(|e| e.to_string())?;
+                Ok(ResolvedProvider {
+                    provider: Arc::clone(&steal_prov),
+                    binding: res.binding,
+                })
+            }),
+        )
+        .with_lease_ttl_ms(20);
+        assert!(
+            steal_svc
+                .start(steal_sid, "lose lease".into(), mid_binding, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn repaired_tail_tool_result_signed_thinking_redaction_and_warm_prefix_source_cap_regressions()
+     {
+        use crate::{
+            profile::ProfileCatalog,
+            provider::{ProviderUsage, ThinkingBlock, ToolCall},
+            registry::ProviderRegistry,
+        };
+        use latte_core::{
+            CompactionPolicy, CompactionStrategy, ContextPolicy, IdSource, PermissionMode,
+            SessionTurnStatus, SessionTurnSummary, SystemIdSource, TranscriptEntry,
+            TranscriptEntryId, TurnId,
+        };
+
+        struct RecordingProv {
+            reqs: Arc<std::sync::Mutex<Vec<ProviderRequest>>>,
+            replies: std::sync::Mutex<std::collections::VecDeque<ProviderResponse>>,
+        }
+        impl Provider for RecordingProv {
+            fn complete(
+                &self,
+                req: ProviderRequest,
+                _ctx: ProviderContext,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<ProviderResponse, ProviderError>>
+                        + Send,
+                >,
+            > {
+                self.reqs.lock().unwrap().push(req);
+                let reply = self.replies.lock().unwrap().pop_front().unwrap();
+                Box::pin(async move { Ok(reply) })
+            }
+        }
+
+        let ids = SystemIdSource::default();
+
+        // 1. Repaired tail ToolResult from Turn 1 projects back into Turn 1's exact assistant batch (#8).
+        let t1 = TurnId::from_uuid(ids.next_uuid_v7());
+        let t2 = TurnId::from_uuid(ids.next_uuid_v7());
+        let mk_entry =
+            |seq: u64,
+             tid: Option<TurnId>,
+             kind: TranscriptKind,
+             text: &str,
+             payload: Option<serde_json::Value>| TranscriptEntry {
+                entry_id: TranscriptEntryId::from_uuid(ids.next_uuid_v7()),
+                sequence: seq,
+                turn_id: tid,
+                kind,
+                text: text.into(),
+                payload,
+                source_key: format!("k:{seq}"),
+                created_at_ms: seq,
+            };
+        let mut snap = SessionSnapshot {
+            session_id: SessionId::from_uuid(ids.next_uuid_v7()),
+            session_revision: 7,
+            sequence: 7,
+            lifecycle: SessionLifecycle::Ready,
+            permission_mode: PermissionMode::Ask,
+            binding: binding(),
+            latest_turn_id: Some(t2),
+            active_turn_id: None,
+            pending: None,
+            turns: vec![
+                SessionTurnSummary {
+                    turn_id: t1,
+                    parent_turn_id: None,
+                    turn_ordinal: 0,
+                    status: SessionTurnStatus::Completed,
+                    turn_revision: 3,
+                    failure_code: None,
+                    completed_at_ms: Some(4),
+                },
+                SessionTurnSummary {
+                    turn_id: t2,
+                    parent_turn_id: Some(t1),
+                    turn_ordinal: 1,
+                    status: SessionTurnStatus::Completed,
+                    turn_revision: 2,
+                    failure_code: None,
+                    completed_at_ms: Some(6),
+                },
+            ],
+            transcript: latte_core::TranscriptPage {
+                entries: vec![
+                    mk_entry(1, Some(t1), TranscriptKind::User, "turn-1 prompt", None),
+                    mk_entry(
+                        2,
+                        Some(t1),
+                        TranscriptKind::Assistant,
+                        "",
+                        Some(serde_json::json!({
+                            "content_absent": true,
+                            "round_id": 1,
+                            "tool_calls": [
+                                {"id": "call-missing", "name": "read_file", "input": {"path": "a.txt"}},
+                                {"id": "call-present", "name": "read_file", "input": {"path": "b.txt"}}
+                            ]
+                        })),
+                    ),
+                    mk_entry(
+                        3,
+                        Some(t1),
+                        TranscriptKind::ToolResult,
+                        "b-ok",
+                        Some(serde_json::json!({
+                            "tool_call_id": "call-present",
+                            "name": "read_file",
+                            "provider_content": "B_CONTENT"
+                        })),
+                    ),
+                    mk_entry(4, Some(t1), TranscriptKind::Assistant, "turn-1 final", None),
+                    mk_entry(5, Some(t2), TranscriptKind::User, "turn-2 prompt", None),
+                    mk_entry(6, Some(t2), TranscriptKind::Assistant, "turn-2 final", None),
+                    // Appended at tail sequence 7 during startup repair!
+                    mk_entry(
+                        7,
+                        Some(t1),
+                        TranscriptKind::ToolResult,
+                        "repaired-a",
+                        Some(serde_json::json!({
+                            "tool_call_id": "call-missing",
+                            "name": "read_file",
+                            "provider_content": "REPAIRED_A_CONTENT",
+                            "repaired_from_observation": true
+                        })),
+                    ),
+                ],
+                next_after: None,
+                has_more: false,
+            },
+            focus: None,
+        };
+        let segments = SessionRuntimeService::scan_history_segments(&snap);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].max_sequence, Some(4));
+        assert_eq!(segments[0].messages.len(), 5);
+        assert!(matches!(
+            &segments[0].messages[2],
+            Message::Tool { tool_call_id, content, .. }
+                if tool_call_id == "call-missing" && content == "REPAIRED_A_CONTENT"
+        ));
+        assert!(matches!(
+            &segments[0].messages[3],
+            Message::Tool { tool_call_id, content, .. }
+                if tool_call_id == "call-present" && content == "B_CONTENT"
+        ));
+        assert!(matches!(
+            &segments[0].messages[4],
+            Message::Assistant { content: Some(text), .. } if text == "turn-1 final"
+        ));
+        assert_eq!(segments[1].messages.len(), 2);
+
+        // Duplicate repaired card is ignored cleanly.
+        snap.transcript.entries.push(mk_entry(
+            8,
+            Some(t1),
+            TranscriptKind::ToolResult,
+            "dup",
+            Some(serde_json::json!({
+                "tool_call_id": "call-missing",
+                "name": "read_file",
+                "provider_content": "DUP",
+                "repaired_from_observation": true
+            })),
+        ));
+        assert_eq!(
+            SessionRuntimeService::scan_history_segments(&snap)[0]
+                .messages
+                .len(),
+            5
+        );
+
+        // 2. Signed thinking block containing secret token preserves signature in-memory for tool round
+        //    while redacting persisted transcript (#13).
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("note.txt"), "hello\n").unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(ws.path())
+            .build()
+            .unwrap();
+        let captured_requests: Arc<std::sync::Mutex<Vec<ProviderRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reqs_clone = Arc::clone(&captured_requests);
+        let prov: Arc<dyn Provider> = Arc::new(RecordingProv {
+            reqs: reqs_clone,
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                ProviderResponse {
+                    message: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-think-1".into(),
+                        name: "read_file".into(),
+                        input: serde_json::json!({"path": "note.txt"}),
+                    }],
+                    input_request: None,
+                    usage: ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: Some(serde_json::json!({
+                        "thinking_blocks": [ThinkingBlock::Thinking {
+                            thinking: "inspecting token=secret-value-12345678901234567890".into(),
+                            signature: Some("sig-opaque-1".into()),
+                        }]
+                    })),
+                },
+                ProviderResponse {
+                    message: Some("completed after signed thinking".into()),
+                    tool_calls: vec![],
+                    input_request: None,
+                    usage: ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                },
+            ])),
+        });
+        let prov_for_factory = Arc::clone(&prov);
+        let svc = SessionRuntimeService::new(
+            engine,
+            ws.path(),
+            SessionHistoryPolicy::default(),
+            Arc::new(move |_| {
+                Ok(ResolvedProvider {
+                    provider: Arc::clone(&prov_for_factory),
+                    binding: crate::registry::ProviderModelBinding::direct(&[]),
+                })
+            }),
+        );
+        let think_sid = SessionId::from_uuid(ids.next_uuid_v7());
+        let think_snap = svc
+            .start(think_sid, "run tool with thinking".into(), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(think_snap.lifecycle, SessionLifecycle::Ready);
+        let round2_req = captured_requests.lock().unwrap()[1].clone();
+        let asst_in_round2 = round2_req
+            .messages
+            .iter()
+            .find_map(|m| match m {
+                Message::Assistant {
+                    thinking_blocks, ..
+                } if !thinking_blocks.is_empty() => Some(thinking_blocks.clone()),
+                _ => None,
+            })
+            .expect("round 2 must receive the exact signed thinking block");
+        assert_eq!(
+            asst_in_round2,
+            vec![ThinkingBlock::Thinking {
+                thinking: "inspecting token=secret-value-12345678901234567890".into(),
+                signature: Some("sig-opaque-1".into()),
+            }]
+        );
+        // Meanwhile, the durable transcript entry MUST be redacted and have signature cleared!
+        let persisted_asst = think_snap
+            .transcript
+            .entries
+            .iter()
+            .find(|e| {
+                e.kind == TranscriptKind::Assistant
+                    && e.payload
+                        .as_ref()
+                        .and_then(|p| p.get("thinking_blocks"))
+                        .is_some()
+            })
+            .unwrap();
+        let persisted_payload = serde_json::to_string(&persisted_asst.payload).unwrap();
+        assert!(!persisted_payload.contains("secret-value-12345678901234567890"));
+        assert!(!persisted_payload.contains("sig-opaque-1"));
+
+        // 3. Warm-prefix summarizer (`reuse_prefix: true`) honors `max_summary_source_bytes` (#14).
+        let cap_ws = tempfile::tempdir().unwrap();
+        let cap_engine = EngineBuilder::new()
+            .workspace_root(cap_ws.path())
+            .build()
+            .unwrap();
+        let cap_desc = cap_engine.tool_descriptors();
+        let cap_reg = Arc::new(
+            ProviderRegistry::parse_jsonc(
+                r#"{version:1,default_model:"claude/m",providers:{claude:{type:"anthropic-messages",models:["m"],base_url:"https://api.anthropic.com/v1/",api_key:"k"}}}"#,
+            )
+            .unwrap(),
+        );
+        let cap_binding = cap_reg.session_binding_for_default(&cap_desc).unwrap();
+        let cap_cat = Arc::new(
+            ProfileCatalog::new(
+                ContextPolicy {
+                    max_request_bytes: 64_000,
+                    max_input_bytes: 64_000,
+                    reserved_output_bytes: 1_024,
+                    context_cap_bytes: 4_096,
+                    compaction: CompactionPolicy {
+                        strategy: CompactionStrategy::ElideToolResultsThenSummarize,
+                        max_summary_source_bytes: 512,
+                        trigger_ratio: 95,
+                        retain_ratio: 1,
+                        reuse_prefix: true,
+                        ..CompactionPolicy::default()
+                    },
+                    ..ContextPolicy::default()
+                },
+                Arc::clone(&cap_reg),
+            )
+            .unwrap(),
+        );
+        let cap_reqs: Arc<std::sync::Mutex<Vec<ProviderRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap_reqs_clone = Arc::clone(&cap_reqs);
+        let cap_prov: Arc<dyn Provider> = Arc::new(RecordingProv {
+            reqs: cap_reqs_clone,
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                ProviderResponse {
+                    message: Some("LARGE_TURN_ONE_".repeat(120)),
+                    tool_calls: vec![],
+                    input_request: None,
+                    usage: ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                },
+                ProviderResponse {
+                    message: Some("turn two answer".into()),
+                    tool_calls: vec![],
+                    input_request: None,
+                    usage: ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                },
+                ProviderResponse {
+                    message: Some("bounded summary".into()),
+                    tool_calls: vec![],
+                    input_request: None,
+                    usage: ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                },
+            ])),
+        });
+        let reg_for_cap = Arc::clone(&cap_reg);
+        let cap_svc = SessionRuntimeService::new(
+            cap_engine,
+            cap_ws.path(),
+            SessionHistoryPolicy {
+                max_request_bytes: 64_000,
+                max_input_bytes: 64_000,
+                reserved_output_bytes: 1_024,
+                context_cap_bytes: 4_096,
+                ..SessionHistoryPolicy::default()
+            },
+            Arc::new(move |sel| {
+                let res = reg_for_cap
+                    .resolve_session_bound(sel, &cap_desc)
+                    .map_err(|e| e.to_string())?;
+                Ok(ResolvedProvider {
+                    provider: Arc::clone(&cap_prov),
+                    binding: res.binding,
+                })
+            }),
+        )
+        .with_profile_catalog(cap_cat);
+        let c_sid = SessionId::from_uuid(ids.next_uuid_v7());
+        let c1 = cap_svc
+            .start(c_sid, "first prompt".into(), cap_binding, None)
+            .await
+            .unwrap();
+        let _c2 = cap_svc
+            .follow_up(c_sid, c1.session_revision, "second prompt".into())
+            .await
+            .unwrap();
+        let compacted = cap_svc.compact_session(c_sid).await.unwrap();
+        assert!(matches!(
+            compacted.state,
+            latte_core::ManualCompactionState::Compacted { .. }
+        ));
+        let summary_req = &cap_reqs.lock().unwrap()[2];
+        // Because Turn 1 exceeded `max_summary_source_bytes = 512`, `reuse_prefix` MUST NOT send
+        // the multi-message warm prefix; it must fall back to `[System, User("<conversation_to_summarize>...")]`!
+        assert_eq!(
+            summary_req.messages.len(),
+            2,
+            "warm-prefix exceeding max_summary_source_bytes must fall back to bounded source_text: {:?}",
+            summary_req.messages
+        );
+        assert!(summary_req.tools.is_empty());
+        let summary_user = summary_req.messages[1].content().unwrap();
+        assert!(summary_user.contains("LARGE_TURN_ONE_"));
+        assert!(summary_user.len() <= 512, "len={}", summary_user.len());
+    }
+
+    #[tokio::test]
+    async fn cancel_durable_and_parked_resume_settle_transient_lease_release_and_fail_closed_on_live_lease()
+     {
+        let root = tempfile::tempdir().unwrap();
+        let engine = latte_engine::EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let service = scripted_service(
+            root.path(),
+            engine.clone(),
+            vec![
+                ProviderResponse {
+                    message: None,
+                    tool_calls: vec![],
+                    input_request: Some(
+                        serde_json::from_value::<InputRequest>(serde_json::json!({
+                            "id": "ask_1",
+                            "prompt": "enter token",
+                            "secret": false
+                        }))
+                        .unwrap(),
+                    ),
+                    usage: crate::provider::ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                },
+                simple_response("resumed after settle"),
+                ProviderResponse {
+                    message: None,
+                    tool_calls: vec![],
+                    input_request: Some(
+                        serde_json::from_value::<InputRequest>(serde_json::json!({
+                            "id": "ask_2",
+                            "prompt": "enter second",
+                            "secret": false
+                        }))
+                        .unwrap(),
+                    ),
+                    usage: crate::provider::ProviderUsage::default(),
+                    finish_reason: None,
+                    provider_state: None,
+                },
+            ],
+        );
+        // 1. Parked `provide_input` waits out a dying runner lease that drops within settle window.
+        let sid1 = SessionId::from_uuid(Uuid::now_v7());
+        let parked1 = service
+            .start(sid1, "park for input".into(), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(parked1.lifecycle, SessionLifecycle::WaitingInput);
+        let held1 = engine.acquire_session_lease(sid1, now_ms(), 5_000).unwrap();
+        let engine_release1 = engine.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            let _ = engine_release1.release_lease(&held1);
+        });
+        let resumed1 = service
+            .provide_input(
+                sid1,
+                parked1.session_revision,
+                test_turn_revision(&parked1),
+                "ask_1".into(),
+                "answer".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed1.lifecycle, SessionLifecycle::Ready);
+
+        // 2. Parked `cancel_durable` fails closed when a foreign lease outlives the settle budget,
+        //    and succeeds cleanly when a lingering guard releases within the settle budget.
+        let sid2 = SessionId::from_uuid(Uuid::now_v7());
+        let parked2 = service
+            .start(sid2, "park for cancel".into(), binding(), None)
+            .await
+            .unwrap();
+        assert_eq!(parked2.lifecycle, SessionLifecycle::WaitingInput);
+        let turn_rev2 = test_turn_revision(&parked2);
+        let stuck_lease = engine
+            .acquire_session_lease(sid2, now_ms(), 10_000)
+            .unwrap();
+        let stuck_err = service
+            .cancel_durable(sid2, parked2.session_revision, turn_rev2)
+            .unwrap_err();
+        assert!(
+            matches!(
+                stuck_err,
+                SessionRuntimeError::Storage(StorageError::EngineUnavailable)
+            ),
+            "expected EngineUnavailable when lease stays held, got {stuck_err:?}"
+        );
+        engine.release_lease(&stuck_lease).unwrap();
+
+        let transient_lease = engine.acquire_session_lease(sid2, now_ms(), 5_000).unwrap();
+        let engine_release2 = engine.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            let _ = engine_release2.release_lease(&transient_lease);
+        });
+        let cancelled = service
+            .cancel_durable(sid2, parked2.session_revision, turn_rev2)
+            .unwrap();
+        assert_eq!(cancelled.lifecycle, SessionLifecycle::Failed);
+    }
+
+    #[tokio::test]
+    async fn pasted_repository_context_user_message_counts_toward_summary_source_cap() {
+        use crate::{profile::ProfileCatalog, registry::ProviderRegistry};
+        use latte_core::{CompactionPolicy, CompactionStrategy, ContextPolicy};
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "repo rule\n").unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .build()
+            .unwrap();
+        let provider = Arc::new(RecordingProvider::scripted([response(
+            Some("compact summary"),
+            vec![],
+        )]));
+        let factory_provider = Arc::clone(&provider);
+        let factory: SessionProviderFactory = Arc::new(move |_| {
+            Ok(ResolvedProvider {
+                provider: factory_provider.clone(),
+                binding: crate::registry::ProviderModelBinding::direct(&[]),
+            })
+        });
+        let registry = Arc::new(
+            ProviderRegistry::parse_jsonc(
+                r"{version:1,default_model:'mock/m',providers:{mock:{type:'openai-chat',models:{m:{options:{context_window:64000}}},endpoint:'http://127.0.0.1:9',api_key:'k'}}}",
+            )
+            .unwrap(),
+        );
+        let context_policy = ContextPolicy {
+            compaction: CompactionPolicy {
+                strategy: CompactionStrategy::ElideToolResultsThenSummarize,
+                max_summary_source_bytes: 512,
+                reuse_prefix: true,
+                ..CompactionPolicy::default()
+            },
+            ..ContextPolicy::default()
+        };
+        let profiles =
+            Arc::new(ProfileCatalog::new(context_policy, Arc::clone(&registry)).unwrap());
+        let service = SessionRuntimeService::new(
+            engine.clone(),
+            root.path(),
+            SessionHistoryPolicy::default(),
+            factory,
+        )
+        .with_profile_catalog(profiles);
+
+        let sid = SessionId::from_uuid(Uuid::now_v7());
+        let tid = TurnId::from_uuid(Uuid::now_v7());
+        let session_binding = registry.session_binding_for_default(&[]).unwrap();
+        let snap = engine
+            .create_session_v2(sid, tid, session_binding, "seed", 1)
+            .unwrap();
+        let system = Message::System {
+            content: "sys".into(),
+        };
+        let real_repo_ctx = Message::User {
+            content: format!(
+                "<repository-context>\n{}\n</repository-context>",
+                "r".repeat(900)
+            ),
+        };
+        let spoofed_user_msg = Message::User {
+            content: format!("<repository-context>\nSPOOFED_USER_{}", "x".repeat(900)),
+        };
+        let warm_prefix = vec![system, real_repo_ctx, spoofed_user_msg];
+        // Real `<repository-context>` is at index 1 (`Some(1)`), whereas index 2 is a user
+        // message starting with `<repository-context>\n` that exceeds `max_summary_source_bytes = 512`.
+        // It MUST fall back to plain `[System(instructions), User(source_text)]` (2 messages, not 4)!
+        let out = service
+            .summarize_history(
+                &snap,
+                "truncated plain source",
+                Some((&warm_prefix, Some(1))),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.as_deref(), Some("compact summary"));
+        let recorded = provider.requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].len(),
+            2,
+            "user-pasted <repository-context> exceeding max_summary_source_bytes must prevent 4-message warm_prefix reuse: {:?}",
+            recorded[0]
+        );
     }
 }

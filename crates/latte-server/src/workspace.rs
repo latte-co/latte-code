@@ -45,8 +45,12 @@ pub struct WorkspaceInstance {
     workspace_root: String,
     /// The session runtime service for this workspace.
     pub runtime: Arc<latte_headless::session::SessionRuntimeService>,
-    /// Event sender for this workspace.
+    /// Authoritative event sender (`SessionChanged`, `ResyncRequired`).
     pub event_tx: broadcast::Sender<ServerEvent>,
+    /// High-capacity transient progress sender (`Progress`), decoupled from
+    /// `event_tx` so high-rate `AssistantDelta` streaming never overflows the
+    /// authoritative `SessionChanged` channel into a `resync_required` storm.
+    pub progress_tx: broadcast::Sender<ServerEvent>,
     /// Engine handle for event subscription.
     pub engine: latte_engine::EngineHandle,
     /// Provider registry for binding discovery.
@@ -70,8 +74,9 @@ impl WorkspaceInstance {
             .to_string_lossy()
             .into_owned();
 
-        // Wire progress events to the workspace event channel.
-        let progress_event_tx = event_tx.clone();
+        // Wire transient progress events to the dedicated high-capacity progress channel.
+        let (progress_tx, _) = broadcast::channel(4096);
+        let progress_event_tx = progress_tx.clone();
         let progress_sink: std::sync::Arc<dyn latte_headless::session::SessionProgressSink> =
             std::sync::Arc::new(
                 move |session_id: latte_core::SessionId,
@@ -102,6 +107,7 @@ impl WorkspaceInstance {
             workspace_root,
             runtime: Arc::new(runtime),
             event_tx,
+            progress_tx,
             engine,
             registry,
         };
@@ -248,7 +254,7 @@ impl WorkspaceInstance {
                         // SSE is wake-up only; clients refetch snapshots.
                         let server_event = ServerEvent::SessionChanged {
                             session_id: event.session_id.to_string(),
-                            revision: event.revision,
+                            session_revision: event.session_revision,
                         };
                         let _ = event_tx.send(server_event);
                     }
@@ -583,7 +589,7 @@ mod tests {
         // rather than a panic.
         let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
         let binding = latte_core::SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "test".into(),
             provider_type: "openai-chat".into(),
             protocol: "chat".into(),
@@ -741,7 +747,7 @@ mod tests {
         // Produce more session events than the channel capacity (64) without
         // yielding, so the bridge receiver falls behind and lags.
         let binding = latte_core::SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "test".into(),
             provider_type: "openai-chat".into(),
             protocol: "chat".into(),
@@ -860,7 +866,7 @@ mod tests {
         // Simulate a crash: a running session whose lease is already expired
         // against the wall clock (absolute expiry at epoch 1001ms).
         let binding = latte_core::SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "test".into(),
             provider_type: "openai-chat".into(),
             protocol: "chat".into(),
@@ -979,7 +985,7 @@ mod tests {
             FinishReason, Provider, ProviderContext, ProviderEvent, ProviderFuture,
             ProviderRequest, ProviderResponse, ProviderUsage,
         };
-        use latte_headless::registry::{ProviderBinding, ResolvedProvider};
+        use latte_headless::registry::{ProviderModelBinding, ResolvedProvider};
 
         // A provider that emits progress events through the context sink before
         // returning a one-step completion, so the workspace progress closure is
@@ -1010,8 +1016,8 @@ mod tests {
             Arc::new(|binding: &latte_core::SessionProviderBinding| {
                 Ok(ResolvedProvider {
                     provider: std::sync::Arc::new(ProgressProvider),
-                    binding: ProviderBinding {
-                        version: binding.version,
+                    binding: ProviderModelBinding {
+                        binding_version: binding.binding_version,
                         provider_name: binding.provider_name.clone(),
                         provider_type: binding.provider_type.clone(),
                         protocol: binding.protocol.clone(),
@@ -1028,11 +1034,11 @@ mod tests {
 
         // Subscribe before starting the turn so the progress events are not
         // missed (broadcast channels only deliver to existing receivers).
-        let mut events = workspace.event_tx.subscribe();
+        let mut events = workspace.progress_tx.subscribe();
 
         let session_id = latte_core::SessionId::from_uuid(uuid::Uuid::now_v7());
         let binding = latte_core::SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "test".into(),
             provider_type: "openai-chat".into(),
             protocol: "chat".into(),

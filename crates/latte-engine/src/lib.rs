@@ -109,22 +109,21 @@ fn resolve_git_common_dir(root: &Path) -> Option<PathBuf> {
     }
 }
 
-fn validate_session_effect_descriptor(
-    descriptor: &SessionEffectDescriptor,
-) -> Result<(), StorageError> {
-    for value in [&descriptor.effect_id, &descriptor.name] {
-        if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
-            return Err(StorageError::InvalidData(
-                "invalid session effect descriptor identifier".into(),
-            ));
-        }
+fn validate_session_effect_authority(authority: &EffectAuthority) -> Result<(), StorageError> {
+    if authority.name.is_empty()
+        || authority.name.len() > 512
+        || authority.name.chars().any(char::is_control)
+    {
+        return Err(StorageError::InvalidData(
+            "invalid session effect descriptor identifier".into(),
+        ));
     }
-    if !latte_core::valid_openai_chat_tool_call_id(&descriptor.tool_call_id) {
+    if !latte_core::valid_openai_chat_tool_call_id(&authority.tool_call_id) {
         return Err(StorageError::InvalidData(
             "invalid provider tool call identifier".into(),
         ));
     }
-    if descriptor.attempt == 0 || !descriptor.input.is_object() {
+    if authority.attempt == 0 || !authority.input.is_object() {
         return Err(StorageError::InvalidData(
             "invalid session effect descriptor input".into(),
         ));
@@ -132,17 +131,19 @@ fn validate_session_effect_descriptor(
     Ok(())
 }
 
-fn session_effect_checkpoint(
+fn session_effect_stage_marker(
     phase: &str,
-    descriptor: &SessionEffectDescriptor,
+    effect_id: &latte_core::EffectId,
+    tool_call_id: &str,
+    name: &str,
     operation_digest: &str,
 ) -> String {
     serde_json::json!({
         "session_effect": {
             "phase": phase,
-            "effect_id": latte_core::redact_session_text(&descriptor.effect_id),
-            "tool_call_id": latte_core::redact_session_text(&descriptor.tool_call_id),
-            "name": latte_core::redact_session_text(&descriptor.name),
+            "effect_id": latte_core::redact_session_text(effect_id.as_str()),
+            "tool_call_id": latte_core::redact_session_text(tool_call_id),
+            "name": latte_core::redact_session_text(name),
             "operation_digest": latte_core::redact_session_text(operation_digest),
         }
     })
@@ -206,7 +207,7 @@ fn summary_argv(value: &str) -> String {
 /// approval. It intentionally summarizes content shape rather than rendering
 /// raw content, while preserving enough target/invocation detail for a user
 /// to distinguish the requested operation.
-fn session_effect_permission_summary(descriptor: &SessionEffectDescriptor) -> String {
+fn session_effect_permission_summary(descriptor: &EffectAuthority) -> String {
     let input = &descriptor.input;
     let summary = match descriptor.name.as_str() {
         "write_file" => {
@@ -215,14 +216,10 @@ fn session_effect_permission_summary(descriptor: &SessionEffectDescriptor) -> St
                 .get("content")
                 .and_then(Value::as_str)
                 .map_or(0, str::len);
-            let intent = if input
-                .get("create_intent")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                "create or replace"
-            } else {
-                "replace existing"
+            let intent = match input.get("create_intent").and_then(Value::as_bool) {
+                Some(true) => "create or replace",
+                Some(false) => "replace existing",
+                None => "write",
             };
             format!("Write {path} ({intent}; {content_bytes} bytes of content)")
         }
@@ -230,13 +227,19 @@ fn session_effect_permission_summary(descriptor: &SessionEffectDescriptor) -> St
             let path = input_string(input, "path", "[unknown path]");
             let before = input
                 .get("before")
+                .or_else(|| input.get("anchor"))
                 .and_then(Value::as_str)
                 .map_or(0, str::len);
             let after = input
                 .get("after")
                 .and_then(Value::as_str)
                 .map_or(0, str::len);
-            format!("Edit {path} (replace one match; {before} bytes → {after} bytes)")
+            let scope = if input.get("replace_all").and_then(Value::as_bool) == Some(true) {
+                "replace all matches"
+            } else {
+                "replace one match"
+            };
+            format!("Edit {path} ({scope}; {before} bytes → {after} bytes)")
         }
         "process" => {
             let cwd = input_string(input, "cwd", ".");
@@ -249,17 +252,16 @@ fn session_effect_permission_summary(descriptor: &SessionEffectDescriptor) -> St
             });
             match argv.filter(|argv| !argv.is_empty()) {
                 Some(argv) => format!("Run argv: {argv} (cwd: {cwd})"),
-                None => format!("Run shell command (cwd: {cwd})"),
+                None => match input.get("shell").and_then(Value::as_str) {
+                    Some(shell) if !shell.trim().is_empty() => {
+                        format!("Run shell command: {} (cwd: {cwd})", summary_argv(shell))
+                    }
+                    _ => format!("Run shell command (cwd: {cwd})"),
+                },
             }
         }
-        "read_file" | "list_directory" => {
-            let verb = if descriptor.name == "read_file" {
-                "Read"
-            } else {
-                "List"
-            };
-            format!("{verb} {}", input_string(input, "path", "[unknown path]"))
-        }
+        "read_file" => format!("Read {}", input_string(input, "path", "[unknown path]")),
+        "list_directory" => format!("List {}", input_string(input, "path", ".")),
         "search" => format!(
             "Search workspace for {}",
             input_string(input, "query", "[unspecified query]")
@@ -325,14 +327,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub use tools::{ToolDescriptor, ToolError, ToolInvocation, ToolOutput};
 
-/// Exact engine-private description of one provider-issued v2 tool call.
+/// Exact engine-private executable authority of one provider-issued v2 tool call.
 ///
 /// This value is accepted at preparation and then retained only in the
 /// engine's private descriptor store. It must never be reconstructed from a
-/// transcript card, checkpoint, event, or provider-history message.
+/// transcript card, stage marker, event, or provider-history message.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SessionEffectDescriptor {
-    pub effect_id: String,
+pub struct EffectAuthority {
+    pub effect_id: latte_core::EffectId,
     pub tool_call_id: String,
     pub name: String,
     pub input: Value,
@@ -348,11 +350,11 @@ pub struct SessionEffectRequest {
     pub expected_turn_revision: u64,
     pub command_id: latte_core::SessionCommandId,
     pub source_key: String,
-    pub descriptor: SessionEffectDescriptor,
+    pub authority: EffectAuthority,
 }
 
 /// Fenced start request for a previously prepared v2 effect. The caller names
-/// the durable effect but cannot supply or alter its executable descriptor.
+/// the durable effect but cannot supply or alter its executable authority.
 #[derive(Clone, Debug)]
 pub struct SessionEffectStartRequest {
     pub session_id: SessionId,
@@ -361,7 +363,7 @@ pub struct SessionEffectStartRequest {
     pub expected_turn_revision: u64,
     pub command_id: latte_core::SessionCommandId,
     pub source_key: String,
-    pub effect_id: String,
+    pub effect_id: latte_core::EffectId,
 }
 
 /// Result of preparing an effect. Ask is returned only after a durable
@@ -373,39 +375,45 @@ pub struct SessionEffectPrepared {
     pub operation_digest: String,
 }
 
-/// Safe display projection accompanying an engine-started v2 effect. This is
-/// intentionally distinct from the exact descriptor held by `SessionEffectStarted`.
+/// Redacted public view accompanying an engine-prepared or engine-started v2
+/// effect. It is structurally separate from [`EffectAuthority`] so redacted
+/// projections cannot be mistaken for executable authority.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SessionEffectPresentation {
-    pub effect_id: String,
+pub struct EffectView {
+    pub effect_id: latte_core::EffectId,
     pub tool_call_id: String,
     pub name: String,
     pub input: Value,
     pub attempt: u64,
 }
 
-impl SessionEffectPresentation {
-    fn from_descriptor(descriptor: &SessionEffectDescriptor) -> Self {
+impl EffectView {
+    /// Builds a secret-redacted display view from an exact [`EffectAuthority`].
+    #[must_use]
+    pub fn from_authority(authority: &EffectAuthority) -> Self {
+        let redacted_id = latte_core::redact_session_text(authority.effect_id.as_str());
+        let effect_id =
+            latte_core::EffectId::new(redacted_id).unwrap_or_else(|_| authority.effect_id.clone());
         Self {
-            effect_id: latte_core::redact_session_text(&descriptor.effect_id),
-            tool_call_id: latte_core::redact_session_text(&descriptor.tool_call_id),
-            name: latte_core::redact_session_text(&descriptor.name),
-            input: latte_core::redact_session_value(descriptor.input.clone()),
-            attempt: descriptor.attempt,
+            effect_id,
+            tool_call_id: latte_core::redact_session_text(&authority.tool_call_id),
+            name: latte_core::redact_session_text(&authority.name),
+            input: latte_core::redact_session_value(authority.input.clone()),
+            attempt: authority.attempt,
         }
     }
 }
 
 /// Durable authority returned after the Started transaction. Holding this
 /// value does not itself execute anything; callers must explicitly invoke the
-/// engine external execution method. Its exact descriptor is private to the
-/// engine; coordinators receive only `presentation`.
+/// engine external execution method. Its exact [`EffectAuthority`] is private
+/// to the engine; coordinators receive only `view`.
 #[derive(Clone, Debug)]
 pub struct SessionEffectStarted {
     pub snapshot: SessionSnapshot,
-    pub presentation: SessionEffectPresentation,
+    pub view: EffectView,
     pub operation_digest: String,
-    descriptor: SessionEffectDescriptor,
+    authority: EffectAuthority,
 }
 
 /// Certified result delivered to a provider as a tool message only after the
@@ -446,6 +454,22 @@ pub(crate) struct VerificationEvidence<'a> {
     pub blob_ref: Option<&'a str>,
 }
 
+/// Outcome of preparing or pre-start-rejecting a model-requested tool call.
+///
+/// Deterministic pre-execution rejections (missing path, path escape, policy
+/// deny, schema mismatch, unread modification target, unsupported platform)
+/// never start an external effect and are recorded as a durable failed
+/// `ToolResult` card so the model can self-correct on the next round without
+/// bricking the session.
+#[derive(Clone, Debug)]
+pub enum SessionEffectPrepareOutcome {
+    Prepared(SessionEffectPrepared),
+    Rejected {
+        snapshot: SessionSnapshot,
+        error_json: String,
+    },
+}
+
 /// Configures and starts an engine actor.
 #[derive(Debug, Default)]
 pub struct EngineBuilder {
@@ -454,6 +478,8 @@ pub struct EngineBuilder {
     enabled_tools: Option<BTreeSet<String>>,
     deny_globs: Vec<String>,
     conversation_root: Option<PathBuf>,
+    permission_mode: latte_core::PermissionMode,
+    require_verification: bool,
 }
 impl EngineBuilder {
     /// Creates a builder.
@@ -465,6 +491,8 @@ impl EngineBuilder {
             enabled_tools: None,
             deny_globs: Vec::new(),
             conversation_root: None,
+            permission_mode: latte_core::PermissionMode::Ask,
+            require_verification: false,
         }
     }
     /// Selects the trusted workspace root for engine-owned tools.
@@ -495,6 +523,18 @@ impl EngineBuilder {
     #[must_use]
     pub fn conversation_root(mut self, path: impl AsRef<Path>) -> Self {
         self.conversation_root = Some(path.as_ref().to_owned());
+        self
+    }
+    /// Sets the default session permission mode enforced by the engine.
+    #[must_use]
+    pub const fn permission_mode(mut self, mode: latte_core::PermissionMode) -> Self {
+        self.permission_mode = mode;
+        self
+    }
+    /// Enforces verified completion whenever a linked turn mutates workspace files.
+    #[must_use]
+    pub const fn require_verification(mut self, required: bool) -> Self {
+        self.require_verification = required;
         self
     }
     /// Starts the actor and initializes durable storage.
@@ -551,19 +591,20 @@ impl EngineBuilder {
             }
             None => storage::Storage::memory()?,
         };
-        let (project_key, vcs_identity, storage_key, git_common_dir) =
+        let (project_key_raw, vcs_identity, storage_key, git_common_dir) =
             workspace_catalog_identity(&root, &workspace_root);
+        let project_key =
+            latte_core::ProjectKey::new(&project_key_raw).map_err(StorageError::InvalidData)?;
         storage.register_workspace(
             &workspace_root,
-            &project_key,
+            project_key.as_str(),
             &vcs_identity,
             &storage_key,
             git_common_dir.as_deref(),
             wall_now_ms(),
         )?;
-        let conversation_store = self
-            .conversation_root
-            .or(inferred_conversation_root)
+        let conversation_root = self.conversation_root.or(inferred_conversation_root);
+        let conversation_store = conversation_root
             .as_deref()
             .map(|root| conversation::ConversationStore::open(root, &storage_key))
             .transpose()
@@ -577,21 +618,18 @@ impl EngineBuilder {
             storage: Arc::new(storage),
             tools: Arc::new(tools),
             workspace_root: Arc::from(workspace_root),
+            project_key,
             process_supervision_supported: cfg!(unix),
             process_group_probe_override: None,
             operation_gate: Arc::new(Semaphore::new(1)),
+            conversation_root,
             conversation_store,
+            default_permission_mode: self.permission_mode,
+            require_verification: self.require_verification,
             #[cfg(test)]
             completion_hook: Arc::new(std::sync::Mutex::new(None)),
         };
-        if handle.conversation_store.is_some() {
-            for session in handle
-                .storage
-                .list_session_summaries_for_workspace(&handle.workspace_root, 500)?
-            {
-                handle.sync_session_conversation(session.session_id)?;
-            }
-        }
+        handle.reconcile_startup_conversations()?;
         Ok(handle)
     }
 }
@@ -690,10 +728,14 @@ pub struct EngineHandle {
     storage: Arc<storage::Storage>,
     tools: Arc<tools::ToolRegistry>,
     workspace_root: Arc<str>,
+    project_key: latte_core::ProjectKey,
     process_supervision_supported: bool,
     process_group_probe_override: Option<process::GroupProbe>,
     operation_gate: Arc<Semaphore>,
+    conversation_root: Option<PathBuf>,
     conversation_store: Option<Arc<conversation::ConversationStore>>,
+    default_permission_mode: latte_core::PermissionMode,
+    require_verification: bool,
     #[cfg(test)]
     completion_hook: CompletionHook,
 }
@@ -705,6 +747,123 @@ impl std::fmt::Debug for EngineHandle {
     }
 }
 impl EngineHandle {
+    /// Returns the logical repository key grouping linked Git worktrees of this workspace.
+    #[must_use]
+    pub const fn project_key(&self) -> &latte_core::ProjectKey {
+        &self.project_key
+    }
+
+    /// Durably updates the permission posture of an existing local session and
+    /// returns its refreshed authoritative snapshot.
+    pub fn set_session_permission_mode_v2(
+        &self,
+        session_id: SessionId,
+        mode: latte_core::PermissionMode,
+    ) -> Result<SessionSnapshot, StorageError> {
+        self.require_local_session(session_id)?;
+        if !self.storage.set_session_permission_mode(session_id, mode)? {
+            return Err(StorageError::SessionNotFound(session_id));
+        }
+        self.session_snapshot_tail_v2(session_id, 500)
+    }
+
+    /// Reads the active permission posture for `session_id` directly from `SQLite`.
+    #[must_use]
+    pub fn session_permission_mode(&self, session_id: SessionId) -> latte_core::PermissionMode {
+        if let Ok(Some(mode)) = self.storage.session_permission_mode(session_id) {
+            return mode;
+        }
+        self.default_permission_mode
+    }
+
+    /// Returns whether this engine enforces post-mutation verification before
+    /// a changed turn may commit `Complete`.
+    #[must_use]
+    pub fn requires_verification(&self) -> bool {
+        self.require_verification
+    }
+
+    fn reconcile_startup_conversations(&self) -> Result<(), StorageError> {
+        let (Some(root), Some(primary_store)) = (&self.conversation_root, &self.conversation_store)
+        else {
+            return Ok(());
+        };
+        self.reconcile_workspace_bucket(&self.workspace_root, primary_store)?;
+        for (ws_root, ws_key) in self.storage.registered_workspaces()? {
+            if ws_root == self.workspace_root.as_ref() {
+                continue;
+            }
+            let bucket_path = root.join(&ws_key);
+            let Ok(metadata) = std::fs::symlink_metadata(&bucket_path) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                continue;
+            }
+            let Ok(other_store) = conversation::ConversationStore::open(root, &ws_key) else {
+                continue;
+            };
+            // Isolate foreign workspace buckets: a sibling workspace exceeding
+            // its orphan-scan cap or having a damaged bucket must not block
+            // opening the current workspace.
+            let _ = self.reconcile_workspace_bucket(&ws_root, &other_store);
+        }
+        Ok(())
+    }
+
+    fn reconcile_workspace_bucket(
+        &self,
+        workspace_root: &str,
+        store: &conversation::ConversationStore,
+    ) -> Result<(), StorageError> {
+        let now_ms = wall_now_ms();
+        let mut to_rebuild = Vec::new();
+        let mut overrides = std::collections::BTreeMap::new();
+        for record in self
+            .storage
+            .materializing_sessions_for_workspace(workspace_root, now_ms)?
+        {
+            let session_id = record.session_id;
+            match store
+                .inspect_for_materializing(session_id)
+                .map_err(StorageError::InvalidData)?
+            {
+                Some(doc) => {
+                    overrides.insert(session_id, record);
+                    to_rebuild.push(doc);
+                }
+                None => {
+                    self.storage.delete_materializing_session(session_id)?;
+                }
+            }
+        }
+        let known = self.storage.all_session_ids()?;
+        let orphans = store
+            .scan_orphans(&known)
+            .map_err(StorageError::InvalidData)?;
+        to_rebuild.extend(orphans);
+        if !to_rebuild.is_empty() {
+            self.storage.rebuild_sessions_from_jsonl(
+                workspace_root,
+                &to_rebuild,
+                &overrides,
+                now_ms,
+            )?;
+        }
+        for (session_id, created_at_ms) in self
+            .storage
+            .sessions_needing_conversation_reconcile(workspace_root)?
+        {
+            self.sync_workspace_session_conversation(
+                workspace_root,
+                store,
+                session_id,
+                created_at_ms,
+            )?;
+        }
+        Ok(())
+    }
+
     fn sync_session_conversation(&self, session_id: SessionId) -> Result<(), StorageError> {
         let Some(store) = &self.conversation_store else {
             return Ok(());
@@ -718,13 +877,75 @@ impl EngineHandle {
                 "cannot write a Session conversation from a foreign workspace".into(),
             ));
         }
-        let entries = self.storage.conversation_outbox_entries(session_id)?;
-        store
-            .sync(session_id, metadata.created_at_ms, &entries)
-            .map_err(StorageError::InvalidData)?;
-        if let Some(sequence) = entries.last().map(|entry| entry.sequence) {
+        self.sync_workspace_session_conversation(
+            &self.workspace_root,
+            store,
+            session_id,
+            metadata.created_at_ms,
+        )
+    }
+
+    fn sync_workspace_session_conversation(
+        &self,
+        _workspace_root: &str,
+        store: &conversation::ConversationStore,
+        session_id: SessionId,
+        created_at_ms: u64,
+    ) -> Result<(), StorageError> {
+        let outbox = self.storage.conversation_outbox_entries(session_id)?;
+        let existing_file = if outbox.is_empty() {
+            store
+                .read_existing(session_id)
+                .map_err(StorageError::InvalidData)?
+        } else {
+            None
+        };
+        if !outbox.is_empty() || existing_file.is_some() {
+            let last_seq = store
+                .sync(session_id, created_at_ms, &outbox)
+                .map_err(StorageError::InvalidData)?;
+            if let Some(sequence) = outbox.last().map(|entry| entry.sequence) {
+                self.storage
+                    .acknowledge_conversation_outbox(session_id, sequence)?;
+            }
             self.storage
-                .acknowledge_conversation_outbox(session_id, sequence)?;
+                .advance_session_last_seq_floor(session_id, last_seq)?;
+        }
+
+        let now_ms = wall_now_ms();
+        let observed = self
+            .storage
+            .observed_effects_for_repair(session_id, now_ms)?;
+        if observed.is_empty() {
+            return Ok(());
+        }
+        let doc = store
+            .read_existing(session_id)
+            .map_err(StorageError::InvalidData)?;
+        let existing_entries = doc
+            .as_ref()
+            .map_or(&[][..], |document| document.entries.as_slice());
+        let jsonl_last_seq = existing_entries.last().map_or(0, |entry| entry.sequence);
+        let missing = find_missing_observed_effects(&observed, existing_entries);
+        if missing.is_empty() {
+            return Ok(());
+        }
+        if self
+            .storage
+            .stage_repaired_tool_results(session_id, jsonl_last_seq, &missing, now_ms)?
+        {
+            let repair_outbox = self.storage.conversation_outbox_entries(session_id)?;
+            if !repair_outbox.is_empty() {
+                let last_seq = store
+                    .sync(session_id, created_at_ms, &repair_outbox)
+                    .map_err(StorageError::InvalidData)?;
+                if let Some(sequence) = repair_outbox.last().map(|entry| entry.sequence) {
+                    self.storage
+                        .acknowledge_conversation_outbox(session_id, sequence)?;
+                }
+                self.storage
+                    .advance_session_last_seq_floor(session_id, last_seq)?;
+            }
         }
         Ok(())
     }
@@ -784,7 +1005,103 @@ impl EngineHandle {
             Err(StorageError::LeaseLost)
         }
     }
+}
 
+fn find_missing_observed_effects(
+    observed: &[storage::ObservedEffectRecord],
+    entries: &[latte_core::TranscriptEntry],
+) -> Vec<storage::ObservedEffectRecord> {
+    let mut floor_by_effect = std::collections::BTreeMap::<String, u64>::new();
+    for entry in entries {
+        match entry.kind {
+            latte_core::TranscriptKind::ToolCall => {
+                if let Some(effect_id) = entry
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("descriptor"))
+                    .and_then(|descriptor| descriptor.get("effect_id"))
+                    .and_then(Value::as_str)
+                {
+                    floor_by_effect.insert(effect_id.to_owned(), entry.sequence);
+                }
+            }
+            latte_core::TranscriptKind::System => {
+                if entry
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("status"))
+                    .and_then(Value::as_str)
+                    == Some("started")
+                    && let Some(effect_id) = entry
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("effect_id"))
+                        .and_then(Value::as_str)
+                {
+                    floor_by_effect.insert(effect_id.to_owned(), entry.sequence);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut matched = vec![false; observed.len()];
+    let mut consumed_result_seqs = std::collections::BTreeSet::<u64>::new();
+
+    // Pass 1: exact match by `payload.effect_id` or deterministic repair `source_key`.
+    for (idx, record) in observed.iter().enumerate() {
+        let repair_key = storage::repair_effect_source_key(record.effect_id.as_str());
+        if let Some(entry) = entries.iter().find(|entry| {
+            entry.kind == latte_core::TranscriptKind::ToolResult
+                && !consumed_result_seqs.contains(&entry.sequence)
+                && (entry.source_key == repair_key
+                    || entry
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("effect_id"))
+                        .and_then(Value::as_str)
+                        == Some(record.effect_id.as_str()))
+        }) {
+            consumed_result_seqs.insert(entry.sequence);
+            matched[idx] = true;
+        }
+    }
+
+    // Pass 2: 1-to-1 chronological match by `(turn_id, tool_call_id)` after the effect floor.
+    for (idx, record) in observed.iter().enumerate() {
+        if matched[idx] {
+            continue;
+        }
+        let floor = floor_by_effect
+            .get(record.effect_id.as_str())
+            .copied()
+            .unwrap_or(0);
+        if let Some(entry) = entries.iter().find(|entry| {
+            entry.kind == latte_core::TranscriptKind::ToolResult
+                && !consumed_result_seqs.contains(&entry.sequence)
+                && entry.turn_id == Some(record.turn_id)
+                && entry.sequence > floor
+                && entry
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("tool_call_id"))
+                    .and_then(Value::as_str)
+                    == Some(record.tool_call_id.as_str())
+        }) {
+            consumed_result_seqs.insert(entry.sequence);
+            matched[idx] = true;
+        }
+    }
+
+    observed
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| !matched[*idx])
+        .map(|(_, record)| record.clone())
+        .collect()
+}
+
+impl EngineHandle {
     fn reject_linked_turn(&self, turn_id: TurnId) -> Result<(), StorageError> {
         if self.storage.is_session_linked_turn(turn_id)? {
             Err(StorageError::LinkedTurnRequiresSessionCommit)
@@ -890,7 +1207,9 @@ impl EngineHandle {
         if lease.owner != invocation.lease_owner || lease.fencing_token != invocation.lease_token {
             return Err(ToolError::InvalidApproval);
         }
-        let (prepared, decision, digest) = self.tools.prepare_for_engine(invocation)?;
+        let (prepared, decision, digest) = self
+            .tools
+            .prepare_for_engine_scoped(invocation, &format!("turn:{turn_id}"))?;
         match decision {
             policy::PolicyDecision::Deny => return Err(ToolError::Denied(invocation.name.into())),
             policy::PolicyDecision::Allow => return self.tools.execute_prepared(prepared),
@@ -1025,16 +1344,16 @@ impl EngineHandle {
         prompt: &str,
         now_ms: u64,
     ) -> Result<SessionSnapshot, StorageError> {
-        let baseline = self
-            .workspace_manifest()
-            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        self.storage.create_session_v2(
+        let baseline = std::collections::BTreeMap::new();
+        let effective_mode = self.session_permission_mode(session_id);
+        self.storage.create_session_v2_with_mode(
             session_id,
             turn_id,
             &binding,
             &self.workspace_root,
             prompt,
             &baseline,
+            effective_mode,
             now_ms,
         )?;
         self.sync_session_conversation(session_id)?;
@@ -1059,10 +1378,81 @@ impl EngineHandle {
         now_ms: u64,
         focus: Option<&str>,
     ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, StorageError> {
-        let baseline = self
-            .workspace_manifest()
-            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        let outcome = self.storage.create_started_session_v2(
+        self.create_started_session_v2_with_mode(
+            command_id, session_id, turn_id, binding, prompt, None, lease, now_ms, focus,
+        )
+    }
+
+    /// Atomically accepts a new Session submission with an optional initial
+    /// permission posture. When `permission_mode` is `Some`, it is persisted
+    /// only if a fresh session is created (`CreateOutcome::Created`); replays,
+    /// conflicts, and validation errors never mutate an existing session's
+    /// permission posture.
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+    pub fn create_started_session_v2_with_mode(
+        &self,
+        command_id: &latte_core::SessionCommandId,
+        session_id: SessionId,
+        turn_id: TurnId,
+        binding: SessionProviderBinding,
+        prompt: &str,
+        permission_mode: Option<latte_core::PermissionMode>,
+        lease: &Lease,
+        now_ms: u64,
+        focus: Option<&str>,
+    ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, StorageError> {
+        let baseline = std::collections::BTreeMap::new();
+        let effective_mode =
+            permission_mode.unwrap_or_else(|| self.session_permission_mode(session_id));
+        if let Some(store) = &self.conversation_store {
+            match self.storage.begin_materializing_session_v2_with_mode(
+                command_id,
+                session_id,
+                turn_id,
+                &binding,
+                &self.workspace_root,
+                prompt,
+                permission_mode,
+                effective_mode,
+                lease,
+                now_ms,
+                focus,
+            )? {
+                storage::BeginMaterializingOutcome::Replayed => {
+                    self.sync_session_conversation(session_id)?;
+                    return Ok(latte_core::CreateOutcome::Replayed(
+                        self.session_snapshot_tail_v2(session_id, 500)?,
+                    ));
+                }
+                storage::BeginMaterializingOutcome::Prepared(prepared) => {
+                    if let Err(error) = store.sync(
+                        session_id,
+                        now_ms,
+                        std::slice::from_ref(&prepared.user_entry),
+                    ) {
+                        let _ = self.storage.delete_materializing_session(session_id);
+                        return Err(StorageError::InvalidData(error));
+                    }
+                    let (_, session_event) = self.storage.activate_materializing_session_v2(
+                        command_id,
+                        &prepared.command_digest,
+                        session_id,
+                        turn_id,
+                        &prepared.user_entry,
+                        &baseline,
+                        false,
+                        lease,
+                        now_ms,
+                    )?;
+                    self.storage
+                        .acknowledge_conversation_outbox(session_id, 1)?;
+                    let snapshot = self.session_snapshot_tail_v2(session_id, 500)?;
+                    let _ = self.session_events.send(session_event.envelope);
+                    return Ok(latte_core::CreateOutcome::Created(snapshot));
+                }
+            }
+        }
+        let outcome = self.storage.create_started_session_v2_with_mode(
             Some(command_id),
             session_id,
             turn_id,
@@ -1070,6 +1460,9 @@ impl EngineHandle {
             &self.workspace_root,
             prompt,
             &baseline,
+            false,
+            permission_mode,
+            effective_mode,
             lease,
             now_ms,
             focus,
@@ -1081,7 +1474,7 @@ impl EngineHandle {
                     protocol_version: latte_core::SESSION_PROTOCOL_VERSION,
                     event_id: latte_core::SessionEventId::from_uuid(uuid::Uuid::now_v7()),
                     session_id,
-                    revision: snapshot.revision,
+                    session_revision: snapshot.session_revision,
                     sequence: snapshot.sequence,
                     event: latte_core::SessionEvent::LifecycleChanged {
                         lifecycle: snapshot.lifecycle,
@@ -1110,13 +1503,90 @@ impl EngineHandle {
         binding: &SessionProviderBinding,
         focus: Option<&str>,
     ) -> Result<Option<SessionSnapshot>, StorageError> {
-        self.storage.lookup_create_replay(
+        self.lookup_create_replay_with_mode(command_id, session_id, prompt, binding, focus, None)
+    }
+
+    /// Mode-aware pre-acquire durable dedup lookup for a session-create command.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lookup_create_replay_with_mode(
+        &self,
+        command_id: &latte_core::SessionCommandId,
+        session_id: SessionId,
+        prompt: &str,
+        binding: &SessionProviderBinding,
+        focus: Option<&str>,
+        permission_mode: Option<latte_core::PermissionMode>,
+    ) -> Result<Option<SessionSnapshot>, StorageError> {
+        if let Some(snapshot) = self.storage.lookup_create_replay_with_mode(
             command_id,
             session_id,
             &self.workspace_root,
             prompt,
             binding,
             focus,
+            permission_mode,
+        )? {
+            return Ok(Some(snapshot));
+        }
+        let Some(record) = self.storage.lookup_materializing_create_command(
+            command_id,
+            session_id,
+            &self.workspace_root,
+            prompt,
+            binding,
+            focus,
+            permission_mode,
+        )?
+        else {
+            return Ok(None);
+        };
+        for _ in 0..5 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if let Some(snapshot) = self.storage.lookup_create_replay_with_mode(
+                command_id,
+                session_id,
+                &self.workspace_root,
+                prompt,
+                binding,
+                focus,
+                permission_mode,
+            )? {
+                return Ok(Some(snapshot));
+            }
+        }
+        if let Some(store) = &self.conversation_store
+            && let Some(doc) = store
+                .inspect_for_materializing(session_id)
+                .map_err(StorageError::InvalidData)?
+        {
+            let mut overrides = std::collections::BTreeMap::new();
+            overrides.insert(session_id, record);
+            self.storage.rebuild_sessions_from_jsonl(
+                &self.workspace_root,
+                std::slice::from_ref(&doc),
+                &overrides,
+                wall_now_ms(),
+            )?;
+            return self.storage.lookup_create_replay_with_mode(
+                command_id,
+                session_id,
+                &self.workspace_root,
+                prompt,
+                binding,
+                focus,
+                permission_mode,
+            );
+        }
+        self.storage
+            .discard_crashed_materializing_session(session_id, command_id)?;
+        self.storage.lookup_create_replay_with_mode(
+            command_id,
+            session_id,
+            &self.workspace_root,
+            prompt,
+            binding,
+            focus,
+            permission_mode,
         )
     }
 
@@ -1158,9 +1628,7 @@ impl EngineHandle {
         prompt: &str,
         now_ms: u64,
     ) -> Result<SessionSnapshot, StorageError> {
-        let baseline = self
-            .workspace_manifest()
-            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let baseline = std::collections::BTreeMap::new();
         self.storage.create_session_follow_up_v2(
             session_id,
             turn_id,
@@ -1192,16 +1660,45 @@ impl EngineHandle {
         lease: &Lease,
         now_ms: u64,
     ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, StorageError> {
-        let baseline = self
-            .workspace_manifest()
-            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        let (outcome, session_event) = self.storage.create_started_session_follow_up_v2(
+        self.create_started_session_follow_up_v2_with_mode(
+            command_id,
+            session_id,
+            turn_id,
+            expected_session_revision,
+            prompt,
+            None,
+            lease,
+            now_ms,
+        )
+    }
+
+    /// Atomically accepts and starts a follow-up child, applying an optional
+    /// `permission_mode` ONLY when the new turn is durably created
+    /// (`CreateOutcome::Created`). Stale revisions, non-ready lifecycles,
+    /// replays, and idempotency mismatches leave the session's permission mode
+    /// untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_started_session_follow_up_v2_with_mode(
+        &self,
+        command_id: Option<&latte_core::SessionCommandId>,
+        session_id: SessionId,
+        turn_id: TurnId,
+        expected_session_revision: u64,
+        prompt: &str,
+        permission_mode: Option<latte_core::PermissionMode>,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<latte_core::CreateOutcome<SessionSnapshot>, StorageError> {
+        let baseline = std::collections::BTreeMap::new();
+        let (outcome, session_event) = self.storage.create_started_session_follow_up_v2_with_mode(
             command_id,
             session_id,
             turn_id,
             expected_session_revision,
             prompt,
             &baseline,
+            false,
+            permission_mode,
             lease,
             now_ms,
         )?;
@@ -1235,11 +1732,30 @@ impl EngineHandle {
         expected_session_revision: u64,
         prompt: &str,
     ) -> Result<Option<SessionSnapshot>, StorageError> {
-        self.storage.lookup_follow_up_replay(
+        self.lookup_follow_up_replay_with_mode(
             command_id,
             session_id,
             expected_session_revision,
             prompt,
+            None,
+        )
+    }
+
+    /// Mode-aware pre-acquire durable dedup lookup for a follow-up command.
+    pub fn lookup_follow_up_replay_with_mode(
+        &self,
+        command_id: &latte_core::SessionCommandId,
+        session_id: SessionId,
+        expected_session_revision: u64,
+        prompt: &str,
+        permission_mode: Option<latte_core::PermissionMode>,
+    ) -> Result<Option<SessionSnapshot>, StorageError> {
+        self.storage.lookup_follow_up_replay_with_mode(
+            command_id,
+            session_id,
+            expected_session_revision,
+            prompt,
+            permission_mode,
         )
     }
 
@@ -1574,18 +2090,14 @@ impl EngineHandle {
         lease: &Lease,
         now_ms: u64,
     ) -> Result<SessionCommitResponse, StorageError> {
-        if matches!(&request.update, CommitSessionTurnUpdate::Complete { .. }) {
-            // `VerificationNotRequired` is legal only for a child whose
-            // engine-owned baseline still equals a stable current workspace
-            // snapshot.  This keeps the public v2 commit entrypoint from
-            // becoming a bypass around configured verification.
+        if self.require_verification
+            && matches!(&request.update, CommitSessionTurnUpdate::Complete { .. })
+        {
+            // When verification is configured, `VerificationNotRequired`
+            // completion is legal only when the linked child recorded zero
+            // workspace mutations.
             let _operation = self.operation_permit();
-            let (_, current_manifest) = self.stable_completion_snapshot()?;
-            if !self
-                .storage
-                .session_changed_files(request.turn_id, &current_manifest)?
-                .is_empty()
-            {
+            if !self.session_turn_changed_files(request.turn_id)?.is_empty() {
                 return Err(StorageError::InvalidData(
                     "linked child changed the workspace; use verified completion".into(),
                 ));
@@ -1596,14 +2108,85 @@ impl EngineHandle {
             .commit_session_turn_update(&request, lease, now_ms)?;
         self.finish_session_response(response)
     }
-    /// Returns the exact files changed since this linked v2 child began.
-    /// The comparison is against an engine-owned baseline captured before the
-    /// provider can receive effect authority.
+
+    fn targeted_session_verification_snapshot(
+        &self,
+        turn_id: TurnId,
+    ) -> Result<(String, Vec<String>), StorageError> {
+        let (baseline_captured, file_mutations, mutating_process_ran) =
+            self.storage.session_turn_mutation_summary(turn_id)?;
+        let mut changed = BTreeSet::new();
+        for authority in &file_mutations {
+            if let Some(raw_path) = authority.input.get("path").and_then(Value::as_str)
+                && let Ok(display) = self.tools.display_path(raw_path)
+            {
+                changed.insert(display);
+            }
+        }
+        if mutating_process_ran || baseline_captured {
+            let (digest, current_manifest) = self.stable_completion_snapshot()?;
+            for path in self
+                .storage
+                .session_changed_files(turn_id, &current_manifest)?
+            {
+                changed.insert(path);
+            }
+            return Ok((digest, changed.into_iter().collect()));
+        }
+        let paths: Vec<String> = changed.into_iter().collect();
+        for _ in 0..3 {
+            let mut first = std::collections::BTreeMap::new();
+            for path in &paths {
+                let entry = self
+                    .tools
+                    .single_file_manifest_digest(path)
+                    .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+                first.insert(path.clone(), entry);
+            }
+            let first_digest = manifest_map_digest(&first)?;
+            let mut second = std::collections::BTreeMap::new();
+            for path in &paths {
+                let entry = self
+                    .tools
+                    .single_file_manifest_digest(path)
+                    .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+                second.insert(path.clone(), entry);
+            }
+            let second_digest = manifest_map_digest(&second)?;
+            if first_digest == second_digest {
+                return Ok((second_digest, paths));
+            }
+        }
+        Err(StorageError::InvalidData(
+            "workspace remained unstable across completion sampling".into(),
+        ))
+    }
+
+    /// Returns the exact files changed by this linked v2 child.
+    /// Pure read-only and file-tool turns resolve in O(1) from engine-owned
+    /// effect records without scanning the workspace tree; mutating `process`
+    /// turns diff against the lazy pre-process baseline.
     pub fn session_turn_changed_files(&self, turn_id: TurnId) -> Result<Vec<String>, StorageError> {
+        let (baseline_captured, file_mutations, mutating_process_ran) =
+            self.storage.session_turn_mutation_summary(turn_id)?;
+        let mut changed = BTreeSet::new();
+        for authority in &file_mutations {
+            if let Some(raw_path) = authority.input.get("path").and_then(Value::as_str)
+                && let Ok(display) = self.tools.display_path(raw_path)
+            {
+                changed.insert(display);
+            }
+        }
+        if !mutating_process_ran && !baseline_captured {
+            return Ok(changed.into_iter().collect());
+        }
         let current = self
             .workspace_manifest()
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        self.storage.session_changed_files(turn_id, &current)
+        for path in self.storage.session_changed_files(turn_id, &current)? {
+            changed.insert(path);
+        }
+        Ok(changed.into_iter().collect())
     }
     /// Persists the actual configured verification result under the linked
     /// child's current fenced revision/effect epoch.  This is deliberately
@@ -1612,12 +2195,13 @@ impl EngineHandle {
         &self,
         turn_id: TurnId,
         expected_revision: u64,
-        effect_id: &str,
+        effect_id: &latte_core::EffectId,
         output: &ProcessOutput,
         lease: &Lease,
         now_ms: u64,
     ) -> Result<(), StorageError> {
-        let (workspace_manifest_digest, _) = self.stable_completion_snapshot()?;
+        let (workspace_manifest_digest, _) =
+            self.targeted_session_verification_snapshot(turn_id)?;
         let effect_epoch = self.storage.effect_epoch(turn_id)?;
         let summary = serde_json::to_string(output)
             .map(|value| latte_core::redact_session_text(&value))
@@ -1625,7 +2209,7 @@ impl EngineHandle {
         let metadata = serde_json::to_string(&storage::VerificationRecord {
             revision: expected_revision,
             effect_epoch,
-            effect_id: effect_id.to_owned(),
+            effect_id: effect_id.as_str().to_owned(),
             passed: output.command_succeeded(),
             workspace_manifest_digest,
             summary,
@@ -1636,7 +2220,7 @@ impl EngineHandle {
             expected_revision,
             lease,
             &VerificationEvidence {
-                id: effect_id,
+                id: effect_id.as_str(),
                 metadata_json: &metadata,
                 blob_ref: None,
             },
@@ -1650,7 +2234,7 @@ impl EngineHandle {
         &self,
         snapshot: &SessionSnapshot,
         summary: String,
-        verification_effect_id: String,
+        verification_effect_id: latte_core::EffectId,
         lease: &Lease,
         now_ms: u64,
     ) -> Result<SessionSnapshot, StorageError> {
@@ -1658,17 +2242,15 @@ impl EngineHandle {
         let turn_id = snapshot
             .active_turn_id
             .ok_or(StorageError::SessionActiveTurnMismatch)?;
-        let expected_turn_revision = turn_revision(snapshot, &verification_effect_id)
+        let expected_turn_revision = turn_revision(snapshot, verification_effect_id.as_str())
             .ok_or_else(|| StorageError::InvalidData("linked child is missing".into()))?;
-        let (verified_manifest_digest, current_manifest) = self.stable_completion_snapshot()?;
-        let files_changed = self
-            .storage
-            .session_changed_files(turn_id, &current_manifest)?;
+        let (verified_manifest_digest, files_changed) =
+            self.targeted_session_verification_snapshot(turn_id)?;
         self.commit_session_turn_update(
             SessionCommitRequest {
                 session_id: snapshot.session_id,
                 turn_id,
-                expected_session_revision: snapshot.revision,
+                expected_session_revision: snapshot.session_revision,
                 expected_turn_revision,
                 command_id: latte_core::SessionCommandId::from_uuid(uuid::Uuid::now_v7()),
                 request_id: None,
@@ -1688,69 +2270,188 @@ impl EngineHandle {
     }
     /// Validates policy and effect preconditions, then durably records a
     /// prepared v2 descriptor.  It never executes the descriptor.
+    #[allow(clippy::too_many_lines)]
     pub fn prepare_session_effect(
         &self,
-        request: SessionEffectRequest,
+        mut request: SessionEffectRequest,
         lease: &Lease,
         now_ms: u64,
     ) -> Result<SessionEffectPrepared, StorageError> {
-        validate_session_effect_descriptor(&request.descriptor)?;
-        let (policy, mut operation_digest) = self.session_effect_policy_and_digest(
-            &request.descriptor,
+        validate_session_effect_authority(&request.authority)?;
+        let snapshot_scope = format!("session:{}", request.session_id);
+        request.authority = self
+            .tools
+            .resolve_session_mutation_authority(&snapshot_scope, request.authority)
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let (base_policy, allow_digest) = self.session_effect_policy_and_digest(
+            request.session_id,
+            &request.authority,
             request.expected_turn_revision,
             lease,
         )?;
-        if policy == SessionEffectPolicy::Ask {
+        let view = EffectView::from_authority(&request.authority);
+        let descriptor_json = serde_json::to_string(&view)
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let canonical_descriptor_json = serde_json::to_string(&request.authority)
+            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+        let description = session_effect_permission_summary(&request.authority);
+        let allow_stage_marker_json = session_effect_stage_marker(
+            "prepared",
+            &view.effect_id,
+            &view.tool_call_id,
+            &view.name,
+            &allow_digest,
+        );
+        let allow_request = SessionCommitRequest {
+            session_id: request.session_id,
+            turn_id: request.turn_id,
+            expected_session_revision: request.expected_session_revision,
+            expected_turn_revision: request.expected_turn_revision,
+            command_id: request.command_id,
+            request_id: None,
+            effect_id: Some(view.effect_id.clone()),
+            update: CommitSessionTurnUpdate::PrepareEffect {
+                source_key: request.source_key.clone(),
+                effect_id: view.effect_id.clone(),
+                operation_digest: allow_digest.clone(),
+                descriptor_json: descriptor_json.clone(),
+                canonical_descriptor_json: canonical_descriptor_json.clone(),
+                policy: SessionEffectPolicy::Allow,
+                description: description.clone(),
+                effect_stage_marker_json: allow_stage_marker_json,
+            },
+        };
+        let mut ask_digest_opt = None;
+        let ask_request = if base_policy == SessionEffectPolicy::Ask {
             let post_approval_revision = request
                 .expected_turn_revision
                 .checked_add(2)
                 .ok_or_else(|| StorageError::InvalidData("run revision overflow".into()))?;
             let (_same_policy, rebound_digest) = self.session_effect_policy_and_digest(
-                &request.descriptor,
+                request.session_id,
+                &request.authority,
                 post_approval_revision,
                 lease,
             )?;
-            operation_digest = rebound_digest;
-        }
-        let persisted = SessionEffectDescriptor {
-            input: latte_core::redact_session_value(request.descriptor.input.clone()),
-            ..request.descriptor.clone()
-        };
-        let descriptor_json = serde_json::to_string(&persisted)
-            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        let canonical_descriptor_json = serde_json::to_string(&request.descriptor)
-            .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        let checkpoint_json = session_effect_checkpoint("prepared", &persisted, &operation_digest);
-        let description = session_effect_permission_summary(&request.descriptor);
-        let response = self.commit_session_turn_update(
-            SessionCommitRequest {
+            let ask_stage_marker_json = session_effect_stage_marker(
+                "prepared",
+                &view.effect_id,
+                &view.tool_call_id,
+                &view.name,
+                &rebound_digest,
+            );
+            ask_digest_opt = Some(rebound_digest.clone());
+            Some(SessionCommitRequest {
                 session_id: request.session_id,
                 turn_id: request.turn_id,
                 expected_session_revision: request.expected_session_revision,
                 expected_turn_revision: request.expected_turn_revision,
                 command_id: request.command_id,
                 request_id: None,
-                effect_id: Some(persisted.effect_id.clone()),
+                effect_id: Some(view.effect_id.clone()),
                 update: CommitSessionTurnUpdate::PrepareEffect {
                     source_key: request.source_key,
-                    effect_id: persisted.effect_id,
-                    operation_digest: operation_digest.clone(),
+                    effect_id: view.effect_id,
+                    operation_digest: rebound_digest,
                     descriptor_json,
                     canonical_descriptor_json,
-                    policy,
+                    policy: SessionEffectPolicy::Ask,
                     description,
-                    checkpoint_json,
+                    effect_stage_marker_json: ask_stage_marker_json,
                 },
-            },
+            })
+        } else {
+            None
+        };
+        let (raw_response, policy) = self.storage.commit_session_turn_update_with_ask_fallback(
+            &allow_request,
+            ask_request.as_ref(),
+            &request.authority.name,
             lease,
             now_ms,
         )?;
+        let response = self.finish_session_response(raw_response)?;
+        let operation_digest = match policy {
+            SessionEffectPolicy::Allow => allow_digest,
+            SessionEffectPolicy::Ask => ask_digest_opt
+                .ok_or_else(|| StorageError::InvalidData("missing ask operation digest".into()))?,
+        };
         Ok(SessionEffectPrepared {
             snapshot: response.snapshot,
             policy,
             operation_digest,
         })
     }
+
+    /// Prepares a model-requested tool call, or durably records a failed
+    /// `ToolResult` card when pre-execution validation rejects the call
+    /// (e.g. missing path, path escape, `deny_globs`, unread modification target,
+    /// schema error, or disabled tool) so the agent loop can self-correct.
+    pub fn prepare_or_reject_session_effect(
+        &self,
+        mut request: SessionEffectRequest,
+        lease: &Lease,
+        now_ms: u64,
+    ) -> Result<SessionEffectPrepareOutcome, StorageError> {
+        validate_session_effect_authority(&request.authority)?;
+        let snapshot_scope = format!("session:{}", request.session_id);
+        let precheck = match self
+            .tools
+            .resolve_session_mutation_authority(&snapshot_scope, request.authority.clone())
+        {
+            Ok(resolved) => {
+                request.authority = resolved;
+                self.session_effect_policy_and_digest(
+                    request.session_id,
+                    &request.authority,
+                    request.expected_turn_revision,
+                    lease,
+                )
+            }
+            Err(error) => Err(StorageError::InvalidData(error.to_string())),
+        };
+        match precheck {
+            Ok(_) => self
+                .prepare_session_effect(request, lease, now_ms)
+                .map(SessionEffectPrepareOutcome::Prepared),
+            Err(StorageError::InvalidData(reason)) => {
+                let redacted_reason = latte_core::redact_session_text(&reason);
+                let error_json = serde_json::json!({ "error": redacted_reason }).to_string();
+                let view = EffectView::from_authority(&request.authority);
+                let response = self.commit_session_turn_update(
+                    SessionCommitRequest {
+                        session_id: request.session_id,
+                        turn_id: request.turn_id,
+                        expected_session_revision: request.expected_session_revision,
+                        expected_turn_revision: request.expected_turn_revision,
+                        command_id: request.command_id,
+                        request_id: None,
+                        effect_id: None,
+                        update: CommitSessionTurnUpdate::AppendTranscript {
+                            source_key: format!("{}:rejected", request.source_key),
+                            kind: TranscriptKind::ToolResult,
+                            text: error_json.clone(),
+                            payload: Some(serde_json::json!({
+                                "provider_content": error_json,
+                                "tool_call_id": view.tool_call_id,
+                                "name": view.name,
+                                "effect_id": view.effect_id.to_string(),
+                                "error": redacted_reason,
+                            })),
+                        },
+                    },
+                    lease,
+                    now_ms,
+                )?;
+                Ok(SessionEffectPrepareOutcome::Rejected {
+                    snapshot: response.snapshot,
+                    error_json,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Resolves a prepared v2 Ask effect. When permission is allowed after a
     /// waiting Session has released its old coordinator lease, the operation
     /// digest and single-use capability are rebound atomically to the current
@@ -1769,12 +2470,14 @@ impl EngineHandle {
         lease: &Lease,
         now_ms: u64,
     ) -> Result<SessionSnapshot, StorageError> {
+        let effect_id =
+            latte_core::EffectId::new(request_id.clone()).map_err(StorageError::InvalidData)?;
         let rebound_operation_digest = if allow {
-            let descriptor = self
+            let authority = self
                 .storage
                 .session_effect_canonical_descriptor(&request_id, turn_id)?;
-            validate_session_effect_descriptor(&descriptor)?;
-            if descriptor.effect_id != request_id {
+            validate_session_effect_authority(&authority)?;
+            if authority.effect_id != effect_id {
                 return Err(StorageError::InvalidData(
                     "canonical session effect identifier mismatch".into(),
                 ));
@@ -1783,8 +2486,13 @@ impl EngineHandle {
                 .checked_add(1)
                 .ok_or_else(|| StorageError::InvalidData("run revision overflow".into()))?;
             Some(
-                self.session_effect_policy_and_digest(&descriptor, post_approval_revision, lease)?
-                    .1,
+                self.session_effect_policy_and_digest(
+                    session_id,
+                    &authority,
+                    post_approval_revision,
+                    lease,
+                )?
+                .1,
             )
         } else {
             None
@@ -1797,7 +2505,7 @@ impl EngineHandle {
                 expected_turn_revision,
                 command_id,
                 request_id: Some(request_id.clone()),
-                effect_id: Some(request_id.clone()),
+                effect_id: Some(effect_id),
                 update: CommitSessionTurnUpdate::ResolvePermission {
                     source_key,
                     request_id,
@@ -1819,17 +2527,18 @@ impl EngineHandle {
         lease: &Lease,
         now_ms: u64,
     ) -> Result<SessionEffectStarted, StorageError> {
-        let descriptor = self
+        let authority = self
             .storage
-            .session_effect_canonical_descriptor(&request.effect_id, request.turn_id)?;
-        validate_session_effect_descriptor(&descriptor)?;
-        if descriptor.effect_id != request.effect_id {
+            .session_effect_canonical_descriptor(request.effect_id.as_str(), request.turn_id)?;
+        validate_session_effect_authority(&authority)?;
+        if authority.effect_id != request.effect_id {
             return Err(StorageError::InvalidData(
                 "canonical session effect identifier mismatch".into(),
             ));
         }
         let (_policy, exact_digest) = self.session_effect_policy_and_digest(
-            &descriptor,
+            request.session_id,
+            &authority,
             request.expected_turn_revision,
             lease,
         )?;
@@ -1838,7 +2547,24 @@ impl EngineHandle {
                 "canonical session effect digest mismatch".into(),
             ));
         }
-        let checkpoint_json = session_effect_checkpoint("started", &descriptor, &operation_digest);
+        if authority.name == "process"
+            && !authority.effect_id.is_verification()
+            && !process::is_readonly_process_input(&authority.input)
+            && !self.storage.is_turn_baseline_captured(request.turn_id)?
+        {
+            let manifest = self
+                .workspace_manifest()
+                .map_err(|error| StorageError::InvalidData(error.to_string()))?;
+            self.storage
+                .store_lazy_turn_baseline(request.turn_id, &manifest)?;
+        }
+        let effect_stage_marker_json = session_effect_stage_marker(
+            "started",
+            &authority.effect_id,
+            &authority.tool_call_id,
+            &authority.name,
+            &operation_digest,
+        );
         let response = self.commit_session_turn_update(
             SessionCommitRequest {
                 session_id: request.session_id,
@@ -1846,13 +2572,13 @@ impl EngineHandle {
                 expected_session_revision: request.expected_session_revision,
                 expected_turn_revision: request.expected_turn_revision,
                 command_id: request.command_id,
-                request_id: Some(request.effect_id.clone()),
+                request_id: Some(request.effect_id.to_string()),
                 effect_id: Some(request.effect_id.clone()),
                 update: CommitSessionTurnUpdate::StartEffect {
                     source_key: request.source_key,
                     effect_id: request.effect_id,
                     operation_digest: operation_digest.clone(),
-                    checkpoint_json,
+                    effect_stage_marker_json,
                 },
             },
             lease,
@@ -1860,9 +2586,9 @@ impl EngineHandle {
         )?;
         Ok(SessionEffectStarted {
             snapshot: response.snapshot,
-            presentation: SessionEffectPresentation::from_descriptor(&descriptor),
+            view: EffectView::from_authority(&authority),
             operation_digest,
-            descriptor,
+            authority,
         })
     }
     /// Runs a descriptor only after a successful Started transaction.  The
@@ -1876,11 +2602,12 @@ impl EngineHandle {
     ) -> Result<SessionEffectObservedValue, SessionEffectExecutionError> {
         Self::ensure_session_lease(started.snapshot.session_id, lease)
             .map_err(|error| SessionEffectExecutionError::Uncertain(error.to_string()))?;
-        let descriptor = &started.descriptor;
+        let authority = &started.authority;
         let (_policy, digest) = self
             .session_effect_policy_and_digest(
-                descriptor,
-                turn_revision(&started.snapshot, descriptor.effect_id.as_str()).ok_or_else(
+                started.snapshot.session_id,
+                authority,
+                turn_revision(&started.snapshot, authority.effect_id.as_str()).ok_or_else(
                     || SessionEffectExecutionError::Uncertain("started run is missing".into()),
                 )?,
                 lease,
@@ -1891,10 +2618,10 @@ impl EngineHandle {
                 "prepared descriptor no longer has the exact operation digest".into(),
             ));
         }
-        if descriptor.name == "process" {
+        if authority.name == "process" {
             self.execute_started_session_process(
-                descriptor,
-                turn_revision(&started.snapshot, descriptor.effect_id.as_str()).ok_or_else(
+                authority,
+                turn_revision(&started.snapshot, authority.effect_id.as_str()).ok_or_else(
                     || SessionEffectExecutionError::Uncertain("started run is missing".into()),
                 )?,
                 lease,
@@ -1902,18 +2629,20 @@ impl EngineHandle {
             )
             .await
         } else {
-            let revision = turn_revision(&started.snapshot, descriptor.effect_id.as_str())
+            let revision = turn_revision(&started.snapshot, authority.effect_id.as_str())
                 .ok_or_else(|| {
                     SessionEffectExecutionError::Uncertain("started run is missing".into())
                 })?;
+            let session_id = started.snapshot.session_id;
             let engine = self.clone();
-            let descriptor = descriptor.clone();
+            let authority = authority.clone();
             let operation_digest = started.operation_digest.clone();
             let lease = lease.clone();
             let cancellation = cancellation.clone();
             tokio::task::spawn_blocking(move || {
                 engine.execute_started_session_tool(
-                    &descriptor,
+                    session_id,
+                    &authority,
                     revision,
                     &operation_digest,
                     &lease,
@@ -1934,38 +2663,46 @@ impl EngineHandle {
     /// let a Started effect outlive its authority window.
     fn execute_started_session_tool(
         &self,
-        descriptor: &SessionEffectDescriptor,
+        session_id: SessionId,
+        authority: &EffectAuthority,
         revision: u64,
         operation_digest: &str,
         lease: &Lease,
         cancellation: &CancellationToken,
     ) -> Result<SessionEffectObservedValue, SessionEffectExecutionError> {
         if cancellation.is_cancelled() {
-            return Err(SessionEffectExecutionError::Uncertain(
-                "tool cancelled after Started".into(),
-            ));
+            return Err(if tools::is_readonly_tool_name(&authority.name) {
+                SessionEffectExecutionError::Certified("tool cancelled after Started".into())
+            } else {
+                SessionEffectExecutionError::Uncertain("tool cancelled after Started".into())
+            });
         }
         let invocation = ToolInvocation {
-            name: &descriptor.name,
-            input: &descriptor.input,
+            name: &authority.name,
+            input: &authority.input,
             turn_revision: revision,
-            effect_id: &descriptor.effect_id,
-            attempt: descriptor.attempt,
-            precondition: descriptor.input.get("precondition").and_then(Value::as_str),
+            effect_id: authority.effect_id.as_str(),
+            attempt: authority.attempt,
+            precondition: authority.input.get("precondition").and_then(Value::as_str),
             timeout_ms: 30_000,
             output_cap: 64 * 1024,
             approval_digest: None,
             lease_owner: lease.owner(),
             lease_token: lease.fencing_token(),
         };
-        let (prepared, decision, exact) =
-            self.tools
-                .prepare_for_engine(&invocation)
-                .map_err(|error| {
+        let snapshot_scope = format!("session:{session_id}");
+        let (prepared, decision, exact) = self
+            .tools
+            .prepare_for_engine_scoped(&invocation, &snapshot_scope)
+            .map_err(|error| {
+                if tools::is_readonly_tool_name(&authority.name) {
+                    SessionEffectExecutionError::Certified(error.to_string())
+                } else {
                     SessionEffectExecutionError::Uncertain(format!(
                         "effect precondition changed: {error}"
                     ))
-                })?;
+                }
+            })?;
         if exact != operation_digest || decision == policy::PolicyDecision::Deny {
             return Err(SessionEffectExecutionError::Uncertain(
                 "effect authorization changed before execution".into(),
@@ -1976,8 +2713,8 @@ impl EngineHandle {
             Ok(output) => Ok(SessionEffectObservedValue {
                 result: serde_json::to_string(&output.value).unwrap_or_else(|_| "null".into()),
                 payload: Some(latte_core::redact_session_value(serde_json::json!({
-                    "tool_call_id": descriptor.tool_call_id,
-                    "name": descriptor.name,
+                    "tool_call_id": authority.tool_call_id,
+                    "name": authority.name,
                     "output": output.value,
                     "truncated": output.truncated,
                 }))),
@@ -1985,12 +2722,14 @@ impl EngineHandle {
             }),
             Err(
                 error @ (ToolError::Io(_) | ToolError::Path(_) | ToolError::WorkspaceUnsafe(_)),
-            ) => Err(SessionEffectExecutionError::Uncertain(error.to_string())),
+            ) if !tools::is_readonly_tool_name(&authority.name) => {
+                Err(SessionEffectExecutionError::Uncertain(error.to_string()))
+            }
             Err(error) => Ok(SessionEffectObservedValue {
                 result: serde_json::json!({"error":error.to_string()}).to_string(),
                 payload: Some(serde_json::json!({
-                    "tool_call_id":descriptor.tool_call_id,
-                    "name":descriptor.name,
+                    "tool_call_id":authority.tool_call_id,
+                    "name":authority.name,
                     "error":error.to_string(),
                 })),
                 success: false,
@@ -2008,8 +2747,32 @@ impl EngineHandle {
         lease: &Lease,
         now_ms: u64,
     ) -> Result<SessionEffectObserved, StorageError> {
-        let revision = turn_revision(&started.snapshot, started.descriptor.effect_id.as_str())
+        let revision = turn_revision(&started.snapshot, started.authority.effect_id.as_str())
             .ok_or_else(|| StorageError::InvalidData("started run is missing".into()))?;
+        let mut payload_map = value
+            .payload
+            .and_then(|payload| match payload {
+                Value::Object(map) => Some(map),
+                _ => None,
+            })
+            .unwrap_or_default();
+        payload_map
+            .entry("provider_content".to_owned())
+            .or_insert_with(|| Value::String(value.result.clone()));
+        payload_map
+            .entry("tool_call_id".to_owned())
+            .or_insert_with(|| Value::String(started.view.tool_call_id.clone()));
+        payload_map
+            .entry("name".to_owned())
+            .or_insert_with(|| Value::String(started.view.name.clone()));
+        payload_map.insert(
+            "effect_id".to_owned(),
+            Value::String(started.view.effect_id.to_string()),
+        );
+        if !value.success && !payload_map.contains_key("error") {
+            payload_map.insert("error".to_owned(), Value::String(value.result.clone()));
+        }
+        let normalized_payload = Some(Value::Object(payload_map));
         let response = self.commit_session_turn_update(
             SessionCommitRequest {
                 session_id: started.snapshot.session_id,
@@ -2017,25 +2780,27 @@ impl EngineHandle {
                     .snapshot
                     .active_turn_id
                     .ok_or(StorageError::SessionActiveTurnMismatch)?,
-                expected_session_revision: started.snapshot.revision,
+                expected_session_revision: started.snapshot.session_revision,
                 expected_turn_revision: revision,
                 command_id,
-                request_id: Some(started.descriptor.effect_id.clone()),
-                effect_id: Some(started.descriptor.effect_id.clone()),
+                request_id: Some(started.authority.effect_id.to_string()),
+                effect_id: Some(started.authority.effect_id.clone()),
                 update: CommitSessionTurnUpdate::ObserveEffect {
                     source_key,
-                    effect_id: started.descriptor.effect_id.clone(),
+                    effect_id: started.authority.effect_id.clone(),
                     operation_digest: started.operation_digest.clone(),
                     success: value.success,
                     result: value.result.clone(),
-                    payload: value.payload,
-                    checkpoint_json: session_effect_checkpoint(
+                    payload: normalized_payload,
+                    effect_stage_marker_json: session_effect_stage_marker(
                         if value.success {
                             "observed_success"
                         } else {
                             "observed_failed"
                         },
-                        &started.descriptor,
+                        &started.authority.effect_id,
+                        &started.authority.tool_call_id,
+                        &started.authority.name,
                         &started.operation_digest,
                     ),
                 },
@@ -2059,7 +2824,7 @@ impl EngineHandle {
         lease: &Lease,
         now_ms: u64,
     ) -> Result<SessionSnapshot, StorageError> {
-        let revision = turn_revision(&started.snapshot, started.descriptor.effect_id.as_str())
+        let revision = turn_revision(&started.snapshot, started.authority.effect_id.as_str())
             .ok_or_else(|| StorageError::InvalidData("started run is missing".into()))?;
         self.commit_session_turn_update(
             SessionCommitRequest {
@@ -2068,18 +2833,20 @@ impl EngineHandle {
                     .snapshot
                     .active_turn_id
                     .ok_or(StorageError::SessionActiveTurnMismatch)?,
-                expected_session_revision: started.snapshot.revision,
+                expected_session_revision: started.snapshot.session_revision,
                 expected_turn_revision: revision,
                 command_id,
-                request_id: Some(started.descriptor.effect_id.clone()),
-                effect_id: Some(started.descriptor.effect_id.clone()),
+                request_id: Some(started.authority.effect_id.to_string()),
+                effect_id: Some(started.authority.effect_id.clone()),
                 update: CommitSessionTurnUpdate::UnknownEffect {
                     source_key,
-                    effect_id: started.descriptor.effect_id.clone(),
+                    effect_id: started.authority.effect_id.clone(),
                     operation_digest: started.operation_digest.clone(),
-                    checkpoint_json: session_effect_checkpoint(
+                    effect_stage_marker_json: session_effect_stage_marker(
                         "unknown",
-                        &started.descriptor,
+                        &started.authority.effect_id,
+                        &started.authority.tool_call_id,
+                        &started.authority.name,
                         &started.operation_digest,
                     ),
                 },
@@ -2098,7 +2865,7 @@ impl EngineHandle {
         turn_id: TurnId,
         expected_session_revision: u64,
         expected_turn_revision: u64,
-        effect_id: String,
+        effect_id: latte_core::EffectId,
         source_key: String,
         command_id: latte_core::SessionCommandId,
         lease: &Lease,
@@ -2111,13 +2878,15 @@ impl EngineHandle {
                 expected_session_revision,
                 expected_turn_revision,
                 command_id,
-                request_id: Some(effect_id.clone()),
+                request_id: Some(effect_id.to_string()),
                 effect_id: Some(effect_id.clone()),
                 update: CommitSessionTurnUpdate::ReconcileUnknownEffect {
                     source_key,
                     effect_id,
-                    checkpoint_json: serde_json::json!({"session_effect":"reconciled_unknown"})
-                        .to_string(),
+                    effect_stage_marker_json: serde_json::json!({
+                        "session_effect": "reconciled_unknown"
+                    })
+                    .to_string(),
                 },
             },
             lease,
@@ -2155,22 +2924,23 @@ impl EngineHandle {
     }
     fn session_effect_policy_and_digest(
         &self,
-        descriptor: &SessionEffectDescriptor,
+        session_id: SessionId,
+        authority: &EffectAuthority,
         turn_revision: u64,
         lease: &Lease,
     ) -> Result<(SessionEffectPolicy, String), StorageError> {
-        if descriptor.name == "process" {
+        if authority.name == "process" {
             if !self.process_supervision_supported {
                 return Err(StorageError::InvalidData(
                     "process supervision is unsupported on this platform".into(),
                 ));
             }
-            let spec = process::SessionProcessSpec::from_input(&descriptor.input)
+            let spec = process::SessionProcessSpec::from_input(&authority.input)
                 .map_err(|error| StorageError::InvalidData(error.to_string()))?;
             self.tools
                 .resolve_cwd(&spec.cwd)
                 .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-            let invocation = spec.invocation(turn_revision, descriptor, lease);
+            let invocation = spec.invocation(turn_revision, authority, lease);
             let decision = process::classify(&invocation);
             let policy = match decision {
                 ProcessDecision::Allow => SessionEffectPolicy::Allow,
@@ -2184,21 +2954,22 @@ impl EngineHandle {
             return Ok((policy, process::digest(&invocation)));
         }
         let invocation = ToolInvocation {
-            name: &descriptor.name,
-            input: &descriptor.input,
+            name: &authority.name,
+            input: &authority.input,
             turn_revision,
-            effect_id: &descriptor.effect_id,
-            attempt: descriptor.attempt,
-            precondition: descriptor.input.get("precondition").and_then(Value::as_str),
+            effect_id: authority.effect_id.as_str(),
+            attempt: authority.attempt,
+            precondition: authority.input.get("precondition").and_then(Value::as_str),
             timeout_ms: 30_000,
             output_cap: 64 * 1024,
             approval_digest: None,
             lease_owner: lease.owner(),
             lease_token: lease.fencing_token(),
         };
+        let snapshot_scope = format!("session:{session_id}");
         let (_prepared, decision, digest) = self
             .tools
-            .prepare_for_engine(&invocation)
+            .prepare_for_engine_scoped(&invocation, &snapshot_scope)
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
         let policy = match decision {
             policy::PolicyDecision::Allow => SessionEffectPolicy::Allow,
@@ -2680,7 +3451,7 @@ mod tool_effect_tests {
             .create_session_follow_up_v2(
                 runnable_fork,
                 TurnId::from_uuid(ids.next_uuid_v7()),
-                runnable.revision,
+                runnable.session_revision,
                 "first fork prompt",
                 3,
             )
@@ -2849,9 +3620,9 @@ mod tool_effect_tests {
         );
     }
 
-    fn descriptor(name: &str, input: Value) -> SessionEffectDescriptor {
-        SessionEffectDescriptor {
-            effect_id: format!("effect-{name}"),
+    fn descriptor(name: &str, input: Value) -> EffectAuthority {
+        EffectAuthority {
+            effect_id: format!("effect-{name}").parse().unwrap(),
             tool_call_id: format!("call-{name}"),
             name: name.into(),
             input,
@@ -2861,7 +3632,7 @@ mod tool_effect_tests {
 
     fn test_session_binding() -> SessionProviderBinding {
         SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "test".into(),
             provider_type: "openai-chat".into(),
             protocol: "chat".into(),
@@ -2881,42 +3652,44 @@ mod tool_effect_tests {
             "write_file",
             json!({"path":"safe.txt","content":"ok","create_intent":false}),
         );
-        assert!(validate_session_effect_descriptor(&valid).is_ok());
-        let checkpoint =
-            session_effect_checkpoint("prepared", &valid, "authorization=Bearer live-secret-value");
-        assert!(checkpoint.contains("prepared"));
-        assert!(!checkpoint.contains("live-secret-value"));
-        let presentation = SessionEffectPresentation::from_descriptor(&SessionEffectDescriptor {
+        assert!(validate_session_effect_authority(&valid).is_ok());
+        let stage_marker = session_effect_stage_marker(
+            "prepared",
+            &valid.effect_id,
+            &valid.tool_call_id,
+            &valid.name,
+            "authorization=Bearer live-secret-value",
+        );
+        assert!(stage_marker.contains("prepared"));
+        assert!(!stage_marker.contains("live-secret-value"));
+        let view = EffectView::from_authority(&EffectAuthority {
             input: json!({"token":"live-secret-value","path":"safe.txt"}),
             ..valid.clone()
         });
-        assert_eq!(presentation.input["path"], "safe.txt");
-        assert_ne!(presentation.input["token"], "live-secret-value");
+        assert_eq!(view.input["path"], "safe.txt");
+        assert_ne!(view.input["token"], "live-secret-value");
+        assert!(latte_core::EffectId::new("").is_err());
 
         for invalid in [
-            SessionEffectDescriptor {
-                effect_id: String::new(),
-                ..valid.clone()
-            },
-            SessionEffectDescriptor {
+            EffectAuthority {
                 name: "bad\nname".into(),
                 ..valid.clone()
             },
-            SessionEffectDescriptor {
+            EffectAuthority {
                 tool_call_id: "bad id".into(),
                 ..valid.clone()
             },
-            SessionEffectDescriptor {
+            EffectAuthority {
                 attempt: 0,
                 ..valid.clone()
             },
-            SessionEffectDescriptor {
+            EffectAuthority {
                 input: json!([]),
                 ..valid.clone()
             },
         ] {
             assert!(matches!(
-                validate_session_effect_descriptor(&invalid),
+                validate_session_effect_authority(&invalid),
                 Err(StorageError::InvalidData(_))
             ));
         }
@@ -2969,8 +3742,8 @@ mod tool_effect_tests {
 
     #[test]
     fn permission_summaries_show_operation_context_without_values_or_controls() {
-        let write = SessionEffectDescriptor {
-            effect_id: "write".into(),
+        let write = EffectAuthority {
+            effect_id: "write".parse().unwrap(),
             tool_call_id: "call-write".into(),
             name: "write_file".into(),
             input: json!({
@@ -2987,8 +3760,8 @@ mod tool_effect_tests {
         assert!(!write_summary.contains("live-secret-value"));
         assert!(!write_summary.contains("token=value"));
 
-        let process = SessionEffectDescriptor {
-            effect_id: "process".into(),
+        let process = EffectAuthority {
+            effect_id: "process".parse().unwrap(),
             tool_call_id: "call-process".into(),
             name: "process".into(),
             input: json!({
@@ -3977,15 +4750,24 @@ mod tool_effect_tests {
             .workspace_root(dir.path())
             .build()
             .unwrap();
+        let ids = SystemIdSource::default();
+        let worker_sid = SessionId::from_uuid(ids.next_uuid_v7());
         let lease = engine.acquire_lease("worker", 1, 10_000).unwrap();
 
         let read = descriptor("read_file", json!({"path":"read.txt"}));
         let (policy, read_digest) = engine
-            .session_effect_policy_and_digest(&read, 1, &lease)
+            .session_effect_policy_and_digest(worker_sid, &read, 1, &lease)
             .unwrap();
         assert_eq!(policy, SessionEffectPolicy::Allow);
         let observed = engine
-            .execute_started_session_tool(&read, 1, &read_digest, &lease, &CancellationToken::new())
+            .execute_started_session_tool(
+                worker_sid,
+                &read,
+                1,
+                &read_digest,
+                &lease,
+                &CancellationToken::new(),
+            )
             .unwrap();
         assert!(observed.success);
         assert!(observed.result.contains("read-value"));
@@ -3993,12 +4775,33 @@ mod tool_effect_tests {
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         assert!(matches!(
-            engine.execute_started_session_tool(&read, 1, &read_digest, &lease, &cancelled),
+            engine.execute_started_session_tool(
+                worker_sid,
+                &read,
+                1,
+                &read_digest,
+                &lease,
+                &cancelled
+            ),
+            Err(SessionEffectExecutionError::Certified(message))
+                if message.contains("cancelled")
+        ));
+        let write_cancel = descriptor("write_file", json!({"path":"cancel-out.txt","content":"x"}));
+        assert!(matches!(
+            engine.execute_started_session_tool(
+                worker_sid,
+                &write_cancel,
+                1,
+                "unused",
+                &lease,
+                &cancelled
+            ),
             Err(SessionEffectExecutionError::Uncertain(message))
                 if message.contains("cancelled")
         ));
         assert!(matches!(
             engine.execute_started_session_tool(
+                worker_sid,
                 &read,
                 1,
                 "wrong-digest",
@@ -4012,14 +4815,42 @@ mod tool_effect_tests {
         let disappearing = descriptor("read_file", json!({"path":"disappearing.txt"}));
         std::fs::write(dir.path().join("disappearing.txt"), "present").unwrap();
         let (_, disappearing_digest) = engine
-            .session_effect_policy_and_digest(&disappearing, 1, &lease)
+            .session_effect_policy_and_digest(worker_sid, &disappearing, 1, &lease)
             .unwrap();
         std::fs::remove_file(dir.path().join("disappearing.txt")).unwrap();
         assert!(matches!(
             engine.execute_started_session_tool(
+                worker_sid,
                 &disappearing,
                 1,
                 &disappearing_digest,
+                &lease,
+                &CancellationToken::new(),
+            ),
+            Err(SessionEffectExecutionError::Certified(_))
+        ));
+
+        std::fs::write(dir.path().join("vanishing_mut.txt"), "before\n").unwrap();
+        let vanishing_hash = format!("{:x}", Sha256::digest(b"before\n"));
+        let vanishing_edit = descriptor(
+            "edit_file",
+            json!({
+                "path": "vanishing_mut.txt",
+                "before": "before",
+                "after": "after",
+                "precondition": vanishing_hash,
+            }),
+        );
+        let (_, vanishing_digest) = engine
+            .session_effect_policy_and_digest(worker_sid, &vanishing_edit, 1, &lease)
+            .unwrap();
+        std::fs::remove_file(dir.path().join("vanishing_mut.txt")).unwrap();
+        assert!(matches!(
+            engine.execute_started_session_tool(
+                worker_sid,
+                &vanishing_edit,
+                1,
+                &vanishing_digest,
                 &lease,
                 &CancellationToken::new(),
             ),
@@ -4038,11 +4869,18 @@ mod tool_effect_tests {
             }),
         );
         let (policy, edit_digest) = engine
-            .session_effect_policy_and_digest(&edit, 2, &lease)
+            .session_effect_policy_and_digest(worker_sid, &edit, 2, &lease)
             .unwrap();
         assert_eq!(policy, SessionEffectPolicy::Ask);
         let observed_failure = engine
-            .execute_started_session_tool(&edit, 2, &edit_digest, &lease, &CancellationToken::new())
+            .execute_started_session_tool(
+                worker_sid,
+                &edit,
+                2,
+                &edit_digest,
+                &lease,
+                &CancellationToken::new(),
+            )
             .unwrap();
         assert!(!observed_failure.success);
         assert!(observed_failure.result.contains("match"));
@@ -4054,14 +4892,14 @@ mod tool_effect_tests {
             .unwrap();
         assert!(
             denied
-                .session_effect_policy_and_digest(&edit, 2, &lease)
+                .session_effect_policy_and_digest(worker_sid, &edit, 2, &lease)
                 .unwrap_err()
                 .to_string()
                 .contains("denied")
         );
         let dangerous_process = descriptor("process", json!({"shell":"rm -rf /","cwd":"."}));
         let dangerous_error = engine
-            .session_effect_policy_and_digest(&dangerous_process, 2, &lease)
+            .session_effect_policy_and_digest(worker_sid, &dangerous_process, 2, &lease)
             .unwrap_err()
             .to_string();
         #[cfg(unix)]
@@ -4073,6 +4911,7 @@ mod tool_effect_tests {
         assert!(
             unsupported
                 .session_effect_policy_and_digest(
+                    worker_sid,
                     &descriptor("process", json!({"argv":["/bin/pwd"]})),
                     2,
                     &lease,
@@ -4082,7 +4921,6 @@ mod tool_effect_tests {
                 .contains("unsupported")
         );
 
-        let ids = SystemIdSource::default();
         let session_id = SessionId::from_uuid(ids.next_uuid_v7());
         let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
         let snapshot = engine
@@ -4096,7 +4934,7 @@ mod tool_effect_tests {
                 SessionCommitRequest {
                     session_id,
                     turn_id,
-                    expected_session_revision: snapshot.revision,
+                    expected_session_revision: snapshot.session_revision,
                     expected_turn_revision: snapshot.turns[0].turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
@@ -4114,13 +4952,13 @@ mod tool_effect_tests {
 
         let read = descriptor("read_file", json!({"path":"read.txt"}));
         let (_, read_digest) = engine
-            .session_effect_policy_and_digest(&read, turn_revision, &lease)
+            .session_effect_policy_and_digest(session_id, &read, turn_revision, &lease)
             .unwrap();
         let read_started = SessionEffectStarted {
             snapshot: snapshot.clone(),
-            presentation: SessionEffectPresentation::from_descriptor(&read),
+            view: EffectView::from_authority(&read),
             operation_digest: read_digest,
-            descriptor: read,
+            authority: read,
         };
         assert!(
             engine
@@ -4129,7 +4967,7 @@ mod tool_effect_tests {
                 .unwrap()
                 .success
         );
-        let completion_descriptor = read_started.descriptor.clone();
+        let completion_descriptor = read_started.authority.clone();
         let mut missing_turn = read_started.clone();
         missing_turn.snapshot.active_turn_id = None;
         assert!(matches!(
@@ -4162,11 +5000,11 @@ mod tool_effect_tests {
                 SessionEffectRequest {
                     session_id,
                     turn_id,
-                    expected_session_revision: snapshot.revision,
+                    expected_session_revision: snapshot.session_revision,
                     expected_turn_revision: turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     source_key: "worker:prepare-read".into(),
-                    descriptor: completion_descriptor,
+                    authority: completion_descriptor,
                 },
                 &lease,
                 12,
@@ -4176,16 +5014,17 @@ mod tool_effect_tests {
             engine.session_effect_digest("effect-read_file").unwrap(),
             prepared.operation_digest
         );
+        let read_effect_id: latte_core::EffectId = "effect-read_file".parse().unwrap();
         let started = engine
             .start_session_effect(
                 SessionEffectStartRequest {
                     session_id,
                     turn_id,
-                    expected_session_revision: prepared.snapshot.revision,
+                    expected_session_revision: prepared.snapshot.session_revision,
                     expected_turn_revision: prepared.snapshot.turns[0].turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     source_key: "worker:start-read".into(),
-                    effect_id: "effect-read_file".into(),
+                    effect_id: read_effect_id.clone(),
                 },
                 prepared.operation_digest,
                 &lease,
@@ -4219,7 +5058,7 @@ mod tool_effect_tests {
             .record_session_verification(
                 turn_id,
                 observed_revision,
-                "effect-read_file",
+                &read_effect_id,
                 &verification,
                 &lease,
                 15,
@@ -4229,7 +5068,7 @@ mod tool_effect_tests {
             .complete_session_verified(
                 &observed.snapshot,
                 "verified worker".into(),
-                "effect-read_file".into(),
+                read_effect_id,
                 &lease,
                 16,
             )
@@ -4245,7 +5084,7 @@ mod tool_effect_tests {
             .create_session_follow_up_v2(
                 session_id,
                 follow_up_run,
-                completed.revision,
+                completed.session_revision,
                 "follow up",
                 17,
             )
@@ -4354,11 +5193,12 @@ mod tool_effect_tests {
         // The None branch: no active turn → None.
         let snapshot = SessionSnapshot {
             session_id: SessionId::from_uuid(SystemIdSource::default().next_uuid_v7()),
-            revision: 0,
+            session_revision: 0,
             sequence: 0,
             lifecycle: latte_core::SessionLifecycle::Ready,
+            permission_mode: latte_core::PermissionMode::Ask,
             binding: SessionProviderBinding {
-                version: 2,
+                binding_version: 2,
                 provider_name: String::new(),
                 provider_type: String::new(),
                 protocol: String::new(),
@@ -4743,7 +5583,7 @@ mod tool_effect_tests {
                 SessionCommitRequest {
                     session_id,
                     turn_id,
-                    expected_session_revision: snapshot.revision,
+                    expected_session_revision: snapshot.session_revision,
                     expected_turn_revision: snapshot.turns[0].turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
@@ -4757,9 +5597,9 @@ mod tool_effect_tests {
             )
             .unwrap()
             .snapshot;
-        // Invalid descriptor (empty effect_id) → InvalidData.
-        let invalid = SessionEffectDescriptor {
-            effect_id: String::new(),
+        // Invalid authority (control char in tool name) → InvalidData.
+        let invalid = EffectAuthority {
+            name: "bad\nname".into(),
             ..descriptor("write_file", json!({"path":"x.txt","content":"y"}))
         };
         assert!(matches!(
@@ -4767,11 +5607,11 @@ mod tool_effect_tests {
                 SessionEffectRequest {
                     session_id,
                     turn_id,
-                    expected_session_revision: running.revision,
+                    expected_session_revision: running.session_revision,
                     expected_turn_revision: running.turns[0].turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     source_key: "test:invalid".into(),
-                    descriptor: invalid,
+                    authority: invalid,
                 },
                 &lease,
                 4,
@@ -4785,11 +5625,11 @@ mod tool_effect_tests {
                 SessionEffectRequest {
                     session_id,
                     turn_id,
-                    expected_session_revision: running.revision,
+                    expected_session_revision: running.session_revision,
                     expected_turn_revision: u64::MAX,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     source_key: "test:overflow".into(),
-                    descriptor: valid,
+                    authority: valid,
                 },
                 &lease,
                 5,
@@ -4824,7 +5664,7 @@ mod tool_effect_tests {
                 SessionCommitRequest {
                     session_id,
                     turn_id,
-                    expected_session_revision: snapshot.revision,
+                    expected_session_revision: snapshot.session_revision,
                     expected_turn_revision: snapshot.turns[0].turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
@@ -4845,11 +5685,11 @@ mod tool_effect_tests {
                     SessionEffectStartRequest {
                         session_id,
                         turn_id,
-                        expected_session_revision: running.revision,
+                        expected_session_revision: running.session_revision,
                         expected_turn_revision: running.turns[0].turn_revision,
                         command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                         source_key: "test:unknown".into(),
-                        effect_id: "effect-nonexistent".into(),
+                        effect_id: "effect-nonexistent".parse().unwrap(),
                     },
                     "digest".into(),
                     &lease,
@@ -4864,11 +5704,11 @@ mod tool_effect_tests {
                 SessionEffectRequest {
                     session_id,
                     turn_id,
-                    expected_session_revision: running.revision,
+                    expected_session_revision: running.session_revision,
                     expected_turn_revision: running.turns[0].turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     source_key: "test:prepare".into(),
-                    descriptor: desc.clone(),
+                    authority: desc.clone(),
                 },
                 &lease,
                 5,
@@ -4879,7 +5719,7 @@ mod tool_effect_tests {
                 SessionEffectStartRequest {
                     session_id,
                     turn_id,
-                    expected_session_revision: prepared.snapshot.revision,
+                    expected_session_revision: prepared.snapshot.session_revision,
                     expected_turn_revision: prepared.snapshot.turns[0].turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     source_key: "test:start-wrong".into(),
@@ -4919,7 +5759,7 @@ mod tool_effect_tests {
                 SessionCommitRequest {
                     session_id,
                     turn_id,
-                    expected_session_revision: snapshot.revision,
+                    expected_session_revision: snapshot.session_revision,
                     expected_turn_revision: snapshot.turns[0].turn_revision,
                     command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
                     request_id: None,
@@ -4935,13 +5775,18 @@ mod tool_effect_tests {
             .snapshot;
         let desc = descriptor("read_file", json!({"path":"read.txt"}));
         let (_, digest) = engine
-            .session_effect_policy_and_digest(&desc, running.turns[0].turn_revision, &lease)
+            .session_effect_policy_and_digest(
+                session_id,
+                &desc,
+                running.turns[0].turn_revision,
+                &lease,
+            )
             .unwrap();
         let started = SessionEffectStarted {
             snapshot: running,
-            presentation: SessionEffectPresentation::from_descriptor(&desc),
+            view: EffectView::from_authority(&desc),
             operation_digest: digest,
-            descriptor: desc,
+            authority: desc,
         };
         // A runtime lease (wrong scope) → Uncertain error.
         let runtime_lease = engine.acquire_lease("other", 4, 10_000).unwrap();
@@ -5114,5 +5959,2323 @@ mod tool_effect_tests {
             engine.rename_session_v2(unknown, "title"),
             Err(StorageError::SessionNotFound(_))
         ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn project_key_propagates_across_summaries_and_linked_git_worktrees() {
+        let home = tempfile::tempdir().unwrap();
+        let database = home.path().join("state.db");
+        let conversations = home.path().join("sessions");
+
+        let common_git = tempfile::tempdir().unwrap();
+        let alpha_git = common_git.path().join("worktrees/wt-a");
+        let beta_git = common_git.path().join("worktrees/wt-b");
+        std::fs::create_dir_all(&alpha_git).unwrap();
+        std::fs::create_dir_all(&beta_git).unwrap();
+        std::fs::write(alpha_git.join("commondir"), "../..\n").unwrap();
+        std::fs::write(beta_git.join("commondir"), "../..\n").unwrap();
+
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws_a.path().join(".git"),
+            format!("gitdir: {}\n", alpha_git.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            ws_b.path().join(".git"),
+            format!("gitdir: {}\n", beta_git.display()),
+        )
+        .unwrap();
+
+        let engine_a = EngineBuilder::new()
+            .workspace_root(ws_a.path())
+            .database_path(&database)
+            .conversation_root(&conversations)
+            .build()
+            .unwrap();
+        let engine_b = EngineBuilder::new()
+            .workspace_root(ws_b.path())
+            .database_path(&database)
+            .conversation_root(&conversations)
+            .build()
+            .unwrap();
+        assert_eq!(engine_a.project_key(), engine_b.project_key());
+
+        let ids = SystemIdSource::default();
+        let sid_a = SessionId::from_uuid(ids.next_uuid_v7());
+        engine_a
+            .create_session_v2(
+                sid_a,
+                TurnId::from_uuid(ids.next_uuid_v7()),
+                test_session_binding(),
+                "worktree alpha task",
+                10,
+            )
+            .unwrap();
+        let sid_b = SessionId::from_uuid(ids.next_uuid_v7());
+        engine_b
+            .create_session_v2(
+                sid_b,
+                TurnId::from_uuid(ids.next_uuid_v7()),
+                test_session_binding(),
+                "worktree beta task",
+                20,
+            )
+            .unwrap();
+
+        let expected = Some(engine_a.project_key().clone());
+        assert_eq!(
+            engine_a.session_v2(sid_a).unwrap().unwrap().project_key,
+            expected
+        );
+        assert_eq!(
+            engine_a
+                .rename_session_v2(sid_a, "worktree alpha renamed")
+                .unwrap()
+                .project_key,
+            expected
+        );
+        assert_eq!(
+            engine_a
+                .list_session_summaries_for_workspace(&engine_a.workspace_root, 10)
+                .unwrap()[0]
+                .project_key,
+            expected
+        );
+        assert_eq!(
+            engine_a
+                .find_sessions_by_exact_title_for_workspace(
+                    &engine_a.workspace_root,
+                    "worktree alpha renamed",
+                    10
+                )
+                .unwrap()[0]
+                .project_key,
+            expected
+        );
+        assert_eq!(
+            engine_a
+                .find_sessions_by_exact_title_for_workspace_paged(
+                    &engine_a.workspace_root,
+                    "worktree alpha renamed",
+                    None,
+                    10
+                )
+                .unwrap()
+                .items[0]
+                .project_key,
+            expected
+        );
+        assert_eq!(
+            engine_a.search_sessions("renamed", 10).unwrap()[0].project_key,
+            expected
+        );
+        assert_eq!(
+            engine_b
+                .search_sessions_paged("beta", None, 10)
+                .unwrap()
+                .items[0]
+                .project_key,
+            expected
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn materializing_two_phase_creation_cleans_up_on_jsonl_error_and_reconciles_startup() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let database = home.path().join("state.db");
+        let conversations = home.path().join("sessions");
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .database_path(&database)
+            .conversation_root(&conversations)
+            .build()
+            .unwrap();
+        let ids = SystemIdSource::default();
+
+        // Obstruct <blocked_session>.jsonl with a directory so store.sync fails.
+        let bucket_dir = std::fs::read_dir(&conversations)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let blocked_session = SessionId::from_uuid(ids.next_uuid_v7());
+        let blocked_turn = TurnId::from_uuid(ids.next_uuid_v7());
+        let blocked_path = bucket_dir.join(format!("{blocked_session}.jsonl"));
+        std::fs::create_dir(&blocked_path).unwrap();
+
+        let lease = engine
+            .acquire_session_lease(blocked_session, 10, 10_000)
+            .unwrap();
+        let command_id = latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7());
+        let err = engine
+            .create_started_session_v2(
+                &command_id,
+                blocked_session,
+                blocked_turn,
+                test_session_binding(),
+                "must fail jsonl sync",
+                &lease,
+                11,
+                Some("src/main.rs"),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StorageError::InvalidData(_)));
+        engine.release_lease(&lease).unwrap();
+        std::fs::remove_dir(&blocked_path).unwrap();
+
+        assert!(engine.session_v2(blocked_session).unwrap().is_none());
+        assert!(matches!(
+            engine.session_snapshot_v2(blocked_session, None, 10),
+            Err(StorageError::SessionNotFound(_))
+        ));
+        assert!(matches!(
+            engine.show(blocked_turn),
+            Err(StorageError::TurnNotFound(_))
+        ));
+
+        // Seed three materializing rows directly:
+        // 1. fileless unleased -> startup deletes it
+        // 2. file-backed unleased -> startup promotes it preserving binding + focus
+        // 3. live-leased -> startup leaves it untouched and hidden from discovery
+        let fileless = SessionId::from_uuid(ids.next_uuid_v7());
+        let fileless_lease = engine.acquire_session_lease(fileless, 20, 100).unwrap();
+        engine
+            .storage
+            .begin_materializing_session_v2(
+                &latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                fileless,
+                TurnId::from_uuid(ids.next_uuid_v7()),
+                &test_session_binding(),
+                &engine.workspace_root,
+                "fileless materializing",
+                &fileless_lease,
+                21,
+                None,
+            )
+            .unwrap();
+        engine.release_lease(&fileless_lease).unwrap();
+
+        let promoted = SessionId::from_uuid(ids.next_uuid_v7());
+        let promoted_turn = TurnId::from_uuid(ids.next_uuid_v7());
+        let promoted_lease = engine.acquire_session_lease(promoted, 30, 100).unwrap();
+        let mut custom_binding = test_session_binding();
+        custom_binding.model = "preserved-model".into();
+        let prepared = match engine
+            .storage
+            .begin_materializing_session_v2(
+                &latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                promoted,
+                promoted_turn,
+                &custom_binding,
+                &engine.workspace_root,
+                "promoted materializing",
+                &promoted_lease,
+                31,
+                Some("crates/lib.rs"),
+            )
+            .unwrap()
+        {
+            storage::BeginMaterializingOutcome::Prepared(prepared) => prepared,
+            storage::BeginMaterializingOutcome::Replayed => unreachable!(),
+        };
+        engine
+            .conversation_store
+            .as_ref()
+            .unwrap()
+            .sync(promoted, 31, std::slice::from_ref(&prepared.user_entry))
+            .unwrap();
+        engine.release_lease(&promoted_lease).unwrap();
+
+        let live = SessionId::from_uuid(ids.next_uuid_v7());
+        let live_lease = engine
+            .acquire_session_lease(live, wall_now_ms(), 3_600_000)
+            .unwrap();
+        engine
+            .storage
+            .begin_materializing_session_v2(
+                &latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                live,
+                TurnId::from_uuid(ids.next_uuid_v7()),
+                &test_session_binding(),
+                &engine.workspace_root,
+                "in-flight materializing",
+                &live_lease,
+                wall_now_ms(),
+                None,
+            )
+            .unwrap();
+
+        // Before reopen, all materializing rows are invisible to queries.
+        assert!(engine.list_sessions().unwrap().is_empty());
+        assert!(
+            engine
+                .list_session_summaries_for_workspace(&engine.workspace_root, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            engine
+                .search_sessions("materializing", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(engine.session_v2(promoted).unwrap().is_none());
+        assert!(matches!(
+            engine.session_snapshot_tail_v2(promoted, 10),
+            Err(StorageError::SessionNotFound(_))
+        ));
+        assert!(matches!(
+            engine.session_snapshot_projection_v2(promoted, 10),
+            Err(StorageError::SessionNotFound(_))
+        ));
+        drop(engine);
+
+        let reopened = EngineBuilder::new()
+            .workspace_root(root.path())
+            .database_path(&database)
+            .conversation_root(&conversations)
+            .build()
+            .unwrap();
+        assert!(reopened.session_v2(fileless).unwrap().is_none());
+        assert!(reopened.session_v2(live).unwrap().is_none());
+
+        let promoted_snap = reopened.session_snapshot_v2(promoted, None, 10).unwrap();
+        assert_eq!(promoted_snap.binding.model, "preserved-model");
+        assert_eq!(promoted_snap.focus.as_deref(), Some("crates/lib.rs"));
+        assert_eq!(
+            promoted_snap.lifecycle,
+            latte_core::SessionLifecycle::Interrupted
+        );
+        assert_eq!(promoted_snap.turns.len(), 1);
+        assert_eq!(promoted_snap.turns[0].turn_id, promoted_turn);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn orphaned_jsonl_rebuilds_catalog_lifecycles_model_bindings_tool_rounds_and_fork_lineage() {
+        let ws1 = tempfile::tempdir().unwrap();
+        let ws2 = tempfile::tempdir().unwrap();
+        std::fs::write(ws1.path().join("doc.txt"), "hello").unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let database = home.path().join("state.db");
+        let conversations = home.path().join("sessions");
+
+        let engine1 = EngineBuilder::new()
+            .workspace_root(ws1.path())
+            .database_path(&database)
+            .conversation_root(&conversations)
+            .build()
+            .unwrap();
+        let engine2 = EngineBuilder::new()
+            .workspace_root(ws2.path())
+            .database_path(&database)
+            .conversation_root(&conversations)
+            .build()
+            .unwrap();
+        let ids = SystemIdSource::default();
+
+        // 1. Completed session with 2 tool-call rounds, model switch, and two forks
+        // (one whose parent survives, and one whose parent JSONL is removed).
+        let completed_session = SessionId::from_uuid(ids.next_uuid_v7());
+        let completed_turn = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut snap = engine1
+            .create_session_v2(
+                completed_session,
+                completed_turn,
+                test_session_binding(),
+                "build complete history",
+                10,
+            )
+            .unwrap();
+        let lease = engine1
+            .acquire_session_lease(completed_session, 11, 10_000)
+            .unwrap();
+        snap = engine1
+            .commit_session_turn_update(
+                SessionCommitRequest {
+                    session_id: completed_session,
+                    turn_id: completed_turn,
+                    expected_session_revision: snap.session_revision,
+                    expected_turn_revision: snap.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: CommitSessionTurnUpdate::Start {
+                        source_key: "c:start".into(),
+                    },
+                },
+                &lease,
+                12,
+            )
+            .unwrap()
+            .snapshot;
+        for round in [1_u64, 2] {
+            snap = engine1
+                .commit_session_turn_update(
+                    SessionCommitRequest {
+                        session_id: completed_session,
+                        turn_id: completed_turn,
+                        expected_session_revision: snap.session_revision,
+                        expected_turn_revision: snap.turns[0].turn_revision,
+                        command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                        request_id: None,
+                        effect_id: None,
+                        update: CommitSessionTurnUpdate::AppendTranscript {
+                            source_key: format!("c:round:{round}"),
+                            kind: latte_core::TranscriptKind::Assistant,
+                            text: String::new(),
+                            payload: Some(json!({
+                                "round_id": round,
+                                "tool_calls": [{"id": format!("call-{round}"), "name": "read_file", "input": {"path": "doc.txt"}}]
+                            })),
+                        },
+                    },
+                    &lease,
+                    12 + round,
+                )
+                .unwrap()
+                .snapshot;
+        }
+        snap = engine1
+            .commit_session_turn_update(
+                SessionCommitRequest {
+                    session_id: completed_session,
+                    turn_id: completed_turn,
+                    expected_session_revision: snap.session_revision,
+                    expected_turn_revision: snap.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: CommitSessionTurnUpdate::Complete {
+                        source_key: "c:done".into(),
+                        handoff: latte_core::Handoff {
+                            summary: "completed cleanly".into(),
+                            files_changed: vec![],
+                            evidence: vec![],
+                        },
+                    },
+                },
+                &lease,
+                20,
+            )
+            .unwrap()
+            .snapshot;
+        let _ = engine1.release_lease(&lease);
+        let switch_lease = engine1
+            .acquire_session_lease(completed_session, 21, 10_000)
+            .unwrap();
+        let mut switched_binding = test_session_binding();
+        switched_binding.provider_name = "alt-provider".into();
+        switched_binding.model = "alt-model".into();
+        engine1
+            .switch_session_binding_v2(
+                completed_session,
+                snap.session_revision,
+                &switched_binding,
+                &switch_lease,
+                22,
+            )
+            .unwrap();
+        engine1.release_lease(&switch_lease).unwrap();
+
+        let fork_sid = SessionId::from_uuid(ids.next_uuid_v7());
+        engine1
+            .fork_session_v2(completed_session, fork_sid, Some("forked child"), 25)
+            .unwrap();
+
+        // Vanishing parent for orphan fork test.
+        let vanishing_parent = SessionId::from_uuid(ids.next_uuid_v7());
+        engine1
+            .create_session_v2(
+                vanishing_parent,
+                TurnId::from_uuid(ids.next_uuid_v7()),
+                test_session_binding(),
+                "vanishing parent",
+                30,
+            )
+            .unwrap();
+        let orphan_fork = SessionId::from_uuid(ids.next_uuid_v7());
+        engine1
+            .fork_session_v2(vanishing_parent, orphan_fork, Some("orphan fork"), 31)
+            .unwrap();
+
+        // 2. PermissionDenied, Retryable failure, and Terminal failure sessions.
+        let make_failed_session =
+            |code: latte_core::FailureCode, retryability: latte_core::Retryability, now: u64| {
+                let sid = SessionId::from_uuid(ids.next_uuid_v7());
+                let tid = TurnId::from_uuid(ids.next_uuid_v7());
+                let s = engine1
+                    .create_session_v2(sid, tid, test_session_binding(), "failure case", now)
+                    .unwrap();
+                let l = engine1.acquire_session_lease(sid, now + 1, 10_000).unwrap();
+                let s = engine1
+                    .commit_session_turn_update(
+                        SessionCommitRequest {
+                            session_id: sid,
+                            turn_id: tid,
+                            expected_session_revision: s.session_revision,
+                            expected_turn_revision: s.turns[0].turn_revision,
+                            command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                            request_id: None,
+                            effect_id: None,
+                            update: CommitSessionTurnUpdate::Start {
+                                source_key: "f:start".into(),
+                            },
+                        },
+                        &l,
+                        now + 2,
+                    )
+                    .unwrap()
+                    .snapshot;
+                engine1
+                    .commit_session_turn_update(
+                        SessionCommitRequest {
+                            session_id: sid,
+                            turn_id: tid,
+                            expected_session_revision: s.session_revision,
+                            expected_turn_revision: s.turns[0].turn_revision,
+                            command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                            request_id: None,
+                            effect_id: None,
+                            update: CommitSessionTurnUpdate::Fail {
+                                source_key: "f:fail".into(),
+                                failure: latte_core::TurnFailure {
+                                    code,
+                                    message: "boom".into(),
+                                    retryability,
+                                },
+                            },
+                        },
+                        &l,
+                        now + 3,
+                    )
+                    .unwrap();
+                let _ = engine1.release_lease(&l);
+                sid
+            };
+        let denied_sid = {
+            let sid = SessionId::from_uuid(ids.next_uuid_v7());
+            let tid = TurnId::from_uuid(ids.next_uuid_v7());
+            let s = engine1
+                .create_session_v2(sid, tid, test_session_binding(), "denied case", 40)
+                .unwrap();
+            let l = engine1.acquire_session_lease(sid, 41, 10_000).unwrap();
+            let s = engine1
+                .commit_session_turn_update(
+                    SessionCommitRequest {
+                        session_id: sid,
+                        turn_id: tid,
+                        expected_session_revision: s.session_revision,
+                        expected_turn_revision: s.turns[0].turn_revision,
+                        command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                        request_id: None,
+                        effect_id: None,
+                        update: CommitSessionTurnUpdate::Start {
+                            source_key: "d:start".into(),
+                        },
+                    },
+                    &l,
+                    42,
+                )
+                .unwrap()
+                .snapshot;
+            let prep = engine1
+                .prepare_session_effect(
+                    SessionEffectRequest {
+                        session_id: sid,
+                        turn_id: tid,
+                        expected_session_revision: s.session_revision,
+                        expected_turn_revision: s.turns[0].turn_revision,
+                        command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                        source_key: "d:prep".into(),
+                        authority: EffectAuthority {
+                            effect_id: "d-eff".parse().unwrap(),
+                            tool_call_id: "d-call".into(),
+                            name: "write_file".into(),
+                            input: json!({"path": "out.txt", "content": "x", "create_intent": true}),
+                            attempt: 1,
+                        },
+                    },
+                    &l,
+                    43,
+                )
+                .unwrap();
+            engine1
+                .resolve_session_effect_permission(
+                    sid,
+                    tid,
+                    prep.snapshot.session_revision,
+                    prep.snapshot.turns[0].turn_revision,
+                    "d-eff".into(),
+                    "d:deny".into(),
+                    false,
+                    latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    &l,
+                    44,
+                )
+                .unwrap();
+            let _ = engine1.release_lease(&l);
+            sid
+        };
+        let retryable_sid = make_failed_session(
+            latte_core::FailureCode::RuntimeFailed,
+            latte_core::Retryability::Retryable,
+            50,
+        );
+        let terminal_sid = make_failed_session(
+            latte_core::FailureCode::RuntimeFailed,
+            latte_core::Retryability::Terminal,
+            60,
+        );
+
+        // 3. ReconciliationRequired session (tool started in JSONL without observation).
+        let recon_session = SessionId::from_uuid(ids.next_uuid_v7());
+        let recon_turn = TurnId::from_uuid(ids.next_uuid_v7());
+        let recon_effect = latte_core::EffectId::for_tool_call(
+            recon_turn,
+            latte_core::RoundId::from_u64(2),
+            0,
+            "call-u",
+        )
+        .unwrap();
+        let s = engine1
+            .create_session_v2(
+                recon_session,
+                recon_turn,
+                test_session_binding(),
+                "reconcile me",
+                70,
+            )
+            .unwrap();
+        let l = engine1
+            .acquire_session_lease(recon_session, 71, 10_000)
+            .unwrap();
+        let s = engine1
+            .commit_session_turn_update(
+                SessionCommitRequest {
+                    session_id: recon_session,
+                    turn_id: recon_turn,
+                    expected_session_revision: s.session_revision,
+                    expected_turn_revision: s.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: CommitSessionTurnUpdate::Start {
+                        source_key: "r:start".into(),
+                    },
+                },
+                &l,
+                72,
+            )
+            .unwrap()
+            .snapshot;
+        let auth = EffectAuthority {
+            effect_id: recon_effect.clone(),
+            tool_call_id: "call-u".into(),
+            name: "read_file".into(),
+            input: json!({"path": "doc.txt"}),
+            attempt: 1,
+        };
+        let prep = engine1
+            .prepare_session_effect(
+                SessionEffectRequest {
+                    session_id: recon_session,
+                    turn_id: recon_turn,
+                    expected_session_revision: s.session_revision,
+                    expected_turn_revision: s.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    source_key: "r:prep".into(),
+                    authority: auth,
+                },
+                &l,
+                73,
+            )
+            .unwrap();
+        engine1
+            .start_session_effect(
+                SessionEffectStartRequest {
+                    session_id: recon_session,
+                    turn_id: recon_turn,
+                    expected_session_revision: prep.snapshot.session_revision,
+                    expected_turn_revision: prep.snapshot.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    source_key: "r:start-eff".into(),
+                    effect_id: recon_effect.clone(),
+                },
+                prep.operation_digest,
+                &l,
+                74,
+            )
+            .unwrap();
+        engine1.release_lease(&l).unwrap();
+
+        // 4. Second workspace session (interrupted).
+        let ws2_sid = SessionId::from_uuid(ids.next_uuid_v7());
+        engine2
+            .create_session_v2(
+                ws2_sid,
+                TurnId::from_uuid(ids.next_uuid_v7()),
+                test_session_binding(),
+                "second workspace orphan",
+                80,
+            )
+            .unwrap();
+
+        // Remove vanishing_parent.jsonl, then wipe state.db* completely.
+        let ws1_bucket = engine1
+            .conversation_store
+            .as_ref()
+            .unwrap()
+            .workspace_dir_for_test();
+        std::fs::remove_file(ws1_bucket.join(format!("{vanishing_parent}.jsonl"))).unwrap();
+        drop(engine1);
+        drop(engine2);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(home.path().join(format!("state.db{suffix}")));
+        }
+
+        // Rebuild ws1 + register ws2 on fresh state.db.
+        let rebuilt1 = EngineBuilder::new()
+            .workspace_root(ws1.path())
+            .database_path(&database)
+            .conversation_root(&conversations)
+            .build()
+            .unwrap();
+        let rebuilt2 = EngineBuilder::new()
+            .workspace_root(ws2.path())
+            .database_path(&database)
+            .conversation_root(&conversations)
+            .build()
+            .unwrap();
+
+        let completed_rebuilt = rebuilt1
+            .session_snapshot_v2(completed_session, None, 50)
+            .unwrap();
+        assert_eq!(
+            completed_rebuilt.lifecycle,
+            latte_core::SessionLifecycle::Ready
+        );
+        assert_eq!(completed_rebuilt.binding.provider_name, "alt-provider");
+        assert_eq!(completed_rebuilt.binding.model, "alt-model");
+        assert_eq!(
+            completed_rebuilt.binding.credential_ref_id,
+            "recovered:unbound"
+        );
+        assert_eq!(
+            rebuilt1
+                .session_turn_tool_round_count(completed_turn)
+                .unwrap(),
+            2
+        );
+
+        let fork_summary = rebuilt1.session_v2(fork_sid).unwrap().unwrap();
+        assert_eq!(fork_summary.parent_session_id, Some(completed_session));
+        let orphan_fork_summary = rebuilt1.session_v2(orphan_fork).unwrap().unwrap();
+        assert_eq!(orphan_fork_summary.parent_session_id, None);
+
+        let denied_rebuilt = rebuilt1.session_snapshot_v2(denied_sid, None, 20).unwrap();
+        assert_eq!(
+            denied_rebuilt.lifecycle,
+            latte_core::SessionLifecycle::Ready
+        );
+        assert_eq!(
+            denied_rebuilt.turns[0].failure_code,
+            Some(latte_core::FailureCode::PermissionDenied)
+        );
+
+        let retryable_rebuilt = rebuilt1
+            .session_snapshot_v2(retryable_sid, None, 20)
+            .unwrap();
+        assert_eq!(
+            retryable_rebuilt.lifecycle,
+            latte_core::SessionLifecycle::Ready
+        );
+
+        let terminal_rebuilt = rebuilt1
+            .session_snapshot_v2(terminal_sid, None, 20)
+            .unwrap();
+        assert_eq!(
+            terminal_rebuilt.lifecycle,
+            latte_core::SessionLifecycle::Failed
+        );
+
+        let recon_rebuilt = rebuilt1
+            .session_snapshot_v2(recon_session, None, 20)
+            .unwrap();
+        assert_eq!(
+            recon_rebuilt.lifecycle,
+            latte_core::SessionLifecycle::ReconciliationRequired
+        );
+        assert_eq!(
+            rebuilt1.effect_status(recon_effect.as_str()).unwrap(),
+            EffectStatus::Unknown
+        );
+        let recon_lease = rebuilt1
+            .acquire_session_lease(recon_session, 90, 10_000)
+            .unwrap();
+        let reconciled = rebuilt1
+            .reconcile_session_effect_unknown(
+                recon_session,
+                recon_turn,
+                recon_rebuilt.session_revision,
+                recon_rebuilt.turns[0].turn_revision,
+                recon_effect,
+                "r:reconcile".into(),
+                latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                &recon_lease,
+                91,
+            )
+            .unwrap();
+        assert_eq!(reconciled.lifecycle, latte_core::SessionLifecycle::Failed);
+
+        let ws2_rebuilt = rebuilt2.session_snapshot_v2(ws2_sid, None, 20).unwrap();
+        assert_eq!(
+            ws2_rebuilt.lifecycle,
+            latte_core::SessionLifecycle::Interrupted
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn missing_observed_tool_result_repairs_deterministically_without_reexecution() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("secret.txt"),
+            "hello sk-live-secret-token-1234567890",
+        )
+        .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let database = home.path().join("state.db");
+        let conversations = home.path().join("sessions");
+        let engine = EngineBuilder::new()
+            .workspace_root(root.path())
+            .database_path(&database)
+            .conversation_root(&conversations)
+            .build()
+            .unwrap();
+        let ids = SystemIdSource::default();
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let mut snap = engine
+            .create_session_v2(
+                session_id,
+                turn_id,
+                test_session_binding(),
+                "repair missing tool result",
+                10,
+            )
+            .unwrap();
+        let lease = engine
+            .acquire_session_lease(session_id, 11, 60_000)
+            .unwrap();
+        snap = engine
+            .commit_session_turn_update(
+                SessionCommitRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: snap.session_revision,
+                    expected_turn_revision: snap.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: CommitSessionTurnUpdate::Start {
+                        source_key: "m:start".into(),
+                    },
+                },
+                &lease,
+                12,
+            )
+            .unwrap()
+            .snapshot;
+
+        // Round 1 (ObservedSuccess) and Round 2 (ObservedFailed, with >256-byte EffectId + reused tool_call_id).
+        let eid1: latte_core::EffectId = "eff-round-1".parse().unwrap();
+        let eid2: latte_core::EffectId =
+            format!("eff-round-2-{}", "x".repeat(300)).parse().unwrap();
+        for (idx, eid, succeed) in [(1_u64, eid1.clone(), true), (2_u64, eid2.clone(), false)] {
+            let auth = EffectAuthority {
+                effect_id: eid.clone(),
+                tool_call_id: "call-dup".into(),
+                name: "read_file".into(),
+                input: json!({"path": "secret.txt"}),
+                attempt: 1,
+            };
+            let prep = engine
+                .prepare_session_effect(
+                    SessionEffectRequest {
+                        session_id,
+                        turn_id,
+                        expected_session_revision: snap.session_revision,
+                        expected_turn_revision: snap.turns[0].turn_revision,
+                        command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                        source_key: format!("m:prep:{idx}"),
+                        authority: auth,
+                    },
+                    &lease,
+                    20 + idx,
+                )
+                .unwrap();
+            let started = engine
+                .start_session_effect(
+                    SessionEffectStartRequest {
+                        session_id,
+                        turn_id,
+                        expected_session_revision: prep.snapshot.session_revision,
+                        expected_turn_revision: prep.snapshot.turns[0].turn_revision,
+                        command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                        source_key: format!("m:start:{idx}"),
+                        effect_id: eid,
+                    },
+                    prep.operation_digest,
+                    &lease,
+                    30 + idx,
+                )
+                .unwrap();
+            let value = if succeed {
+                engine
+                    .execute_started_session_effect(&started, &lease, &CancellationToken::new())
+                    .await
+                    .unwrap()
+            } else {
+                SessionEffectObservedValue {
+                    success: false,
+                    result: "certified failure sk-live-secret-token-1234567890".into(),
+                    payload: Some(json!({"error": "certified failure"})),
+                }
+            };
+            snap = engine
+                .observe_session_effect(
+                    &started,
+                    format!("m:obs:{idx}"),
+                    latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    value,
+                    &lease,
+                    40 + idx,
+                )
+                .unwrap()
+                .snapshot;
+        }
+
+        // Also prepare & deny an Ask effect so SQLite has a non-executed `observed_failed` row
+        // (`denied_before_start`), proving repair never invents a ToolResult for it.
+        let denied_eid: latte_core::EffectId = "eff-denied".parse().unwrap();
+        let ask_prep = engine
+            .prepare_session_effect(
+                SessionEffectRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: snap.session_revision,
+                    expected_turn_revision: snap.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    source_key: "m:ask-prep".into(),
+                    authority: EffectAuthority {
+                        effect_id: denied_eid,
+                        tool_call_id: "call-denied".into(),
+                        name: "write_file".into(),
+                        input: json!({"path": "never.txt", "content": "x", "create_intent": true}),
+                        attempt: 1,
+                    },
+                },
+                &lease,
+                50,
+            )
+            .unwrap();
+        engine
+            .resolve_session_effect_permission(
+                session_id,
+                turn_id,
+                ask_prep.snapshot.session_revision,
+                ask_prep.snapshot.turns[0].turn_revision,
+                "eff-denied".into(),
+                "m:ask-deny".into(),
+                false,
+                latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                &lease,
+                51,
+            )
+            .unwrap();
+        let _ = engine.release_lease(&lease);
+
+        // Delete secret.txt so re-execution would fail, and drop both tool_result lines from JSONL.
+        std::fs::remove_file(root.path().join("secret.txt")).unwrap();
+        let bucket = engine
+            .conversation_store
+            .as_ref()
+            .unwrap()
+            .workspace_dir_for_test();
+        let jsonl_path = bucket.join(format!("{session_id}.jsonl"));
+        let mut filtered = std::fs::read_to_string(&jsonl_path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.contains("\"kind\":\"tool_result\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        filtered.push('\n');
+        std::fs::write(&jsonl_path, filtered).unwrap();
+
+        // While a live lease is held on the session, repair defers cleanly.
+        let live = engine
+            .acquire_session_lease(session_id, wall_now_ms(), 60_000)
+            .unwrap();
+        let during_lease = engine.session_snapshot_v2(session_id, None, 50).unwrap();
+        assert!(
+            during_lease
+                .transcript
+                .entries
+                .iter()
+                .all(|e| e.kind != latte_core::TranscriptKind::ToolResult)
+        );
+        engine.release_lease(&live).unwrap();
+
+        // Once unleased, reading repairs both observed tool results deterministically, redacting secrets,
+        // skipping `call-denied`, and staying idempotent across repeat reads.
+        let repaired1 = engine.session_snapshot_v2(session_id, None, 50).unwrap();
+        let repaired2 = engine.session_snapshot_v2(session_id, None, 50).unwrap();
+        assert_eq!(repaired1.transcript.entries, repaired2.transcript.entries);
+
+        let tool_results: Vec<_> = repaired1
+            .transcript
+            .entries
+            .iter()
+            .filter(|e| e.kind == latte_core::TranscriptKind::ToolResult)
+            .collect();
+        assert_eq!(tool_results.len(), 2);
+        assert!(tool_results[0].source_key.starts_with("repair:effect:"));
+        assert!(
+            tool_results[1]
+                .source_key
+                .starts_with("repair:effect:sha256:")
+        );
+        assert!(!tool_results[0].text.contains("sk-live-secret-token"));
+        assert!(tool_results[0].text.contains("[REDACTED]"));
+        assert!(
+            tool_results[0]
+                .payload
+                .as_ref()
+                .unwrap()
+                .get("error")
+                .is_none()
+        );
+        assert_eq!(
+            tool_results[0].payload.as_ref().unwrap()["repaired_from_observation"],
+            true
+        );
+        assert_eq!(
+            tool_results[1].payload.as_ref().unwrap()["error"],
+            "certified failure"
+        );
+
+        // Subsequent follow-up turn advances cleanly above the repaired JSONL sequence floor.
+        let follow_up = engine
+            .create_session_follow_up_v2(
+                session_id,
+                TurnId::from_uuid(ids.next_uuid_v7()),
+                repaired2.session_revision,
+                "continue after repair",
+                60,
+            )
+            .unwrap();
+        assert_eq!(
+            follow_up.transcript.entries.last().unwrap().text,
+            "continue after repair"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn prepare_or_reject_permission_modes_and_zero_scan_changed_files_survive_external_symlinks()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "external").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("references")).unwrap();
+
+        let ids = SystemIdSource::default();
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .permission_mode(latte_core::PermissionMode::Ask)
+            .require_verification(true)
+            .build()
+            .unwrap();
+        let session_id = SessionId::from_uuid(ids.next_uuid_v7());
+        let turn_id = TurnId::from_uuid(ids.next_uuid_v7());
+        let created = engine
+            .create_session_v2(
+                session_id,
+                turn_id,
+                test_session_binding(),
+                "test external symlink + modes",
+                1,
+            )
+            .unwrap();
+        let lease = engine.acquire_session_lease(session_id, 1, 60_000).unwrap();
+        let started_snapshot = engine
+            .commit_session_turn_update(
+                SessionCommitRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: created.session_revision,
+                    expected_turn_revision: created.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: CommitSessionTurnUpdate::Start {
+                        source_key: "start-modes-test".into(),
+                    },
+                },
+                &lease,
+                1,
+            )
+            .unwrap()
+            .snapshot;
+        assert_eq!(
+            engine.session_permission_mode(session_id),
+            latte_core::PermissionMode::Ask
+        );
+
+        // Missing path is rejected into a durable ToolResult without bricking the session.
+        let missing_outcome = engine
+            .prepare_or_reject_session_effect(
+                SessionEffectRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: started_snapshot.session_revision,
+                    expected_turn_revision: started_snapshot.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    source_key: "reject-missing".into(),
+                    authority: EffectAuthority {
+                        effect_id: "effect-missing".parse().unwrap(),
+                        tool_call_id: "call-missing".into(),
+                        name: "read_file".into(),
+                        input: json!({"path": "does-not-exist.rs"}),
+                        attempt: 1,
+                    },
+                },
+                &lease,
+                2,
+            )
+            .unwrap();
+        let after_reject = match missing_outcome {
+            SessionEffectPrepareOutcome::Rejected {
+                snapshot,
+                error_json,
+            } => {
+                assert!(error_json.contains("error"));
+                snapshot
+            }
+            SessionEffectPrepareOutcome::Prepared(_) => panic!("expected Rejected"),
+        };
+
+        // Switch session to AutoEdit: write_file becomes Allow (no Ask), creating nested parent dirs.
+        engine
+            .set_session_permission_mode_v2(session_id, latte_core::PermissionMode::AutoEdit)
+            .unwrap();
+        assert_eq!(
+            engine.session_permission_mode(session_id),
+            latte_core::PermissionMode::AutoEdit
+        );
+        let write_outcome = engine
+            .prepare_or_reject_session_effect(
+                SessionEffectRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: after_reject.session_revision,
+                    expected_turn_revision: after_reject.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    source_key: "prep-write".into(),
+                    authority: EffectAuthority {
+                        effect_id: "effect-write-nested".parse().unwrap(),
+                        tool_call_id: "call-write-nested".into(),
+                        name: "write_file".into(),
+                        input: json!({"path": "nested/dir/hello.rs", "content": "pub fn hi() {}\n"}),
+                        attempt: 1,
+                    },
+                },
+                &lease,
+                3,
+            )
+            .unwrap();
+        let prepared_write = match write_outcome {
+            SessionEffectPrepareOutcome::Prepared(prepared) => {
+                assert_eq!(prepared.policy, SessionEffectPolicy::Allow);
+                prepared
+            }
+            SessionEffectPrepareOutcome::Rejected { .. } => panic!("expected Prepared"),
+        };
+        let started_write = engine
+            .start_session_effect(
+                SessionEffectStartRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: prepared_write.snapshot.session_revision,
+                    expected_turn_revision: prepared_write.snapshot.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    source_key: "start-write".into(),
+                    effect_id: "effect-write-nested".parse().unwrap(),
+                },
+                prepared_write.operation_digest.clone(),
+                &lease,
+                4,
+            )
+            .unwrap();
+        let write_val = engine
+            .execute_started_session_effect(&started_write, &lease, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(write_val.success);
+        let observed_write = engine
+            .observe_session_effect(
+                &started_write,
+                "obs-write".into(),
+                latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                write_val,
+                &lease,
+                5,
+            )
+            .unwrap();
+
+        // Changed files reflect the exact engine-recorded mutation, and require_verification blocks unverified Complete.
+        assert_eq!(
+            engine.session_turn_changed_files(turn_id).unwrap(),
+            vec!["nested/dir/hello.rs".to_owned()]
+        );
+        let unverified_err = engine
+            .commit_session_turn_update(
+                SessionCommitRequest {
+                    session_id,
+                    turn_id,
+                    expected_session_revision: observed_write.snapshot.session_revision,
+                    expected_turn_revision: observed_write.snapshot.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    request_id: None,
+                    effect_id: None,
+                    update: CommitSessionTurnUpdate::Complete {
+                        source_key: "unverified-complete".into(),
+                        handoff: latte_core::Handoff {
+                            summary: "done".into(),
+                            files_changed: vec![],
+                            evidence: vec![],
+                        },
+                    },
+                },
+                &lease,
+                6,
+            )
+            .unwrap_err();
+        assert!(
+            unverified_err
+                .to_string()
+                .contains("use verified completion")
+        );
+
+        // FullAuto promotes process shell Ask -> Allow as well.
+        engine
+            .set_session_permission_mode_v2(session_id, latte_core::PermissionMode::FullAuto)
+            .unwrap();
+        #[cfg(unix)]
+        {
+            let proc_outcome = engine
+                .prepare_or_reject_session_effect(
+                    SessionEffectRequest {
+                        session_id,
+                        turn_id,
+                        expected_session_revision: observed_write.snapshot.session_revision,
+                        expected_turn_revision: observed_write.snapshot.turns[0].turn_revision,
+                        command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                        source_key: "prep-shell".into(),
+                        authority: EffectAuthority {
+                            effect_id: "effect-shell".parse().unwrap(),
+                            tool_call_id: "call-shell".into(),
+                            name: "process".into(),
+                            input: json!({"shell": "echo ok"}),
+                            attempt: 1,
+                        },
+                    },
+                    &lease,
+                    7,
+                )
+                .unwrap();
+            match proc_outcome {
+                SessionEffectPrepareOutcome::Prepared(prepared) => {
+                    assert_eq!(prepared.policy, SessionEffectPolicy::Allow);
+                }
+                SessionEffectPrepareOutcome::Rejected { .. } => panic!("expected Prepared"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn v1_reissue_verification_unknown_effect_and_legacy_import_boundaries() {
+        use std::collections::BTreeMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let empty_env = BTreeMap::new();
+        let classify_argv = |argv: &[String]| {
+            classify(&ProcessInvocation {
+                argv,
+                shell: None,
+                cwd: ".",
+                env: &empty_env,
+                timeout_ms: 1_000,
+                grace_ms: 50,
+                stdout_cap: 1024,
+                stderr_cap: 1024,
+                turn_revision: 1,
+                effect_id: "eff",
+                attempt: 1,
+                approval_digest: None,
+                lease_owner: "o",
+                lease_token: 1,
+            })
+        };
+        let s = |items: &[&str]| items.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            classify_argv(&s(&["rm", "--recursive", "--force", "/"])),
+            ProcessDecision::Deny
+        );
+        assert_eq!(
+            classify_argv(&s(&["rm", "--no-preserve-root", "tmp"])),
+            ProcessDecision::Deny
+        );
+        assert_eq!(
+            classify_argv(&s(&["rm", "--", "-rf", "local_file"])),
+            ProcessDecision::Ask
+        );
+        assert_eq!(classify_argv(&s(&["git"])), ProcessDecision::Ask);
+
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("a.txt"), "hello\n").unwrap();
+        let ro_dir = ws.path().join("ro");
+        std::fs::create_dir_all(&ro_dir).unwrap();
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let db_path = ws.path().join(".latte/state.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let engine = EngineBuilder::new()
+            .workspace_root(ws.path())
+            .database_path(&db_path)
+            .build()
+            .unwrap();
+        let ids = latte_core::SystemIdSource::default();
+        let tid = TurnId::from_uuid(ids.next_uuid_v7());
+        engine.create_turn(tid, 1).unwrap();
+        let old_lease = engine.acquire_turn_lease(tid, "owner-1", 2, 50).unwrap();
+        let mut sub = engine.subscribe();
+        assert!(sub.try_recv().unwrap().is_none());
+        let running = engine
+            .apply_transition(tid, 0, Transition::Start, 3, &old_lease)
+            .unwrap();
+        let _ = sub.recv().await.unwrap();
+        let mut cur_rev = running.revision;
+
+        let read_in = json!({"path": "a.txt"});
+        let sha = engine
+            .execute_tool(
+                tid,
+                &old_lease,
+                4,
+                &ToolInvocation {
+                    name: "read_file",
+                    input: &read_in,
+                    turn_revision: cur_rev,
+                    effect_id: "r1",
+                    attempt: 1,
+                    precondition: None,
+                    timeout_ms: 0,
+                    output_cap: 1024,
+                    approval_digest: None,
+                    lease_owner: old_lease.owner(),
+                    lease_token: old_lease.fencing_token(),
+                },
+            )
+            .unwrap()
+            .value["sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let write_in = json!({"path": "a.txt", "content": "world\n"});
+        let old_write = ToolInvocation {
+            name: "write_file",
+            input: &write_in,
+            turn_revision: cur_rev + 2,
+            effect_id: "old-w",
+            attempt: 1,
+            precondition: Some(&sha),
+            timeout_ms: 0,
+            output_cap: 1024,
+            approval_digest: None,
+            lease_owner: old_lease.owner(),
+            lease_token: old_lease.fencing_token(),
+        };
+        assert!(matches!(
+            engine.execute_tool(tid, &old_lease, 5, &old_write),
+            Err(ToolError::PermissionRequired { .. })
+        ));
+
+        let echo_argv = s(&["/bin/echo", "reissued"]);
+        let old_proc = ProcessInvocation {
+            argv: &echo_argv,
+            shell: None,
+            cwd: ".",
+            env: &empty_env,
+            timeout_ms: 2_000,
+            grace_ms: 50,
+            stdout_cap: 1024,
+            stderr_cap: 1024,
+            turn_revision: cur_rev + 2,
+            effect_id: "old-p",
+            attempt: 1,
+            approval_digest: None,
+            lease_owner: old_lease.owner(),
+            lease_token: old_lease.fencing_token(),
+        };
+        assert!(matches!(
+            engine
+                .execute_process(tid, &old_lease, 6, &old_proc, &CancellationToken::new())
+                .await,
+            Err(ProcessError::PermissionRequired { .. })
+        ));
+
+        let fresh = engine
+            .acquire_turn_lease(tid, "owner-2", 100, 1_000)
+            .unwrap();
+        let fresh_write = ToolInvocation {
+            effect_id: "fresh-w",
+            attempt: 2,
+            lease_owner: fresh.owner(),
+            lease_token: fresh.fencing_token(),
+            ..old_write
+        };
+        let w_digest = engine
+            .reissue_tool_permission("old-w", tid, &fresh, 101, &fresh_write)
+            .unwrap();
+        assert!(!w_digest.is_empty());
+        assert_eq!(
+            engine.effect_status("old-w").unwrap(),
+            EffectStatus::ObservedFailed
+        );
+
+        let fresh_proc = ProcessInvocation {
+            effect_id: "fresh-p",
+            attempt: 2,
+            lease_owner: fresh.owner(),
+            lease_token: fresh.fencing_token(),
+            ..old_proc
+        };
+        let p_digest = engine
+            .reissue_process_permission("old-p", tid, &fresh, 102, &fresh_proc)
+            .unwrap();
+        engine
+            .apply_transition(
+                tid,
+                cur_rev,
+                Transition::RequestPermission(latte_core::PendingPermission {
+                    request_id: "req-p".into(),
+                    operation_digest: p_digest.clone(),
+                    description: "echo".into(),
+                }),
+                103,
+                &fresh,
+            )
+            .unwrap();
+        cur_rev = engine
+            .apply_transition(
+                tid,
+                cur_rev + 1,
+                Transition::ResolvePermission {
+                    request_id: "req-p".into(),
+                    allowed: true,
+                },
+                104,
+                &fresh,
+            )
+            .unwrap()
+            .revision;
+        let approved_proc = ProcessInvocation {
+            approval_digest: Some(&p_digest),
+            turn_revision: cur_rev,
+            ..fresh_proc
+        };
+        let proc_out = engine
+            .execute_process(tid, &fresh, 105, &approved_proc, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(proc_out.command_succeeded());
+
+        let ver_argv = s(&["/bin/pwd"]);
+        let ver_out = engine
+            .execute_verification(
+                tid,
+                cur_rev,
+                &fresh,
+                106,
+                &ProcessInvocation {
+                    argv: &ver_argv,
+                    shell: None,
+                    cwd: ".",
+                    env: &empty_env,
+                    timeout_ms: 2_000,
+                    grace_ms: 50,
+                    stdout_cap: 1024,
+                    stderr_cap: 1024,
+                    turn_revision: cur_rev,
+                    effect_id: "ver-1",
+                    attempt: 1,
+                    approval_digest: None,
+                    lease_owner: fresh.owner(),
+                    lease_token: fresh.fencing_token(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(ver_out.command_succeeded());
+
+        let io_write_in = json!({"path": "ro/blocked.txt", "content": "x", "create_intent": true});
+        let io_write_prep = ToolInvocation {
+            name: "write_file",
+            input: &io_write_in,
+            turn_revision: cur_rev + 2,
+            effect_id: "io-unk",
+            attempt: 1,
+            precondition: None,
+            timeout_ms: 0,
+            output_cap: 1024,
+            approval_digest: None,
+            lease_owner: fresh.owner(),
+            lease_token: fresh.fencing_token(),
+        };
+        let Err(ToolError::PermissionRequired { digest: io_dig, .. }) =
+            engine.execute_tool(tid, &fresh, 111, &io_write_prep)
+        else {
+            panic!("expected PermissionRequired");
+        };
+        engine
+            .apply_transition(
+                tid,
+                cur_rev,
+                Transition::RequestPermission(latte_core::PendingPermission {
+                    request_id: "req-io".into(),
+                    operation_digest: io_dig.clone(),
+                    description: "write".into(),
+                }),
+                112,
+                &fresh,
+            )
+            .unwrap();
+        cur_rev = engine
+            .apply_transition(
+                tid,
+                cur_rev + 1,
+                Transition::ResolvePermission {
+                    request_id: "req-io".into(),
+                    allowed: true,
+                },
+                113,
+                &fresh,
+            )
+            .unwrap()
+            .revision;
+        assert!(
+            engine
+                .execute_tool(
+                    tid,
+                    &fresh,
+                    114,
+                    &ToolInvocation {
+                        approval_digest: Some(&io_dig),
+                        turn_revision: cur_rev,
+                        ..io_write_prep
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(
+            engine.unknown_effects_for_turn(tid).unwrap(),
+            vec!["io-unk".to_owned()]
+        );
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let legacy_src = tempfile::tempdir().unwrap();
+        let legacy_db = legacy_src.path().join("legacy.db");
+        let legacy_engine = EngineBuilder::new()
+            .workspace_root(ws.path())
+            .database_path(&legacy_db)
+            .build()
+            .unwrap();
+        let leg_binding = latte_core::SessionProviderBinding {
+            binding_version: 1,
+            provider_name: "p".into(),
+            provider_type: "openai-chat".into(),
+            protocol: "chat".into(),
+            model: "m".into(),
+            config_fingerprint: "c".into(),
+            tools_fingerprint: "t".into(),
+            aliases: BTreeMap::new(),
+            credential_ref_id: "env:K".into(),
+            data_scope_id: "workspace".into(),
+            credential_generation: 1,
+        };
+        let leg_sid = SessionId::from_uuid(ids.next_uuid_v7());
+        legacy_engine
+            .create_session_v2(
+                leg_sid,
+                TurnId::from_uuid(ids.next_uuid_v7()),
+                leg_binding,
+                "legacy imported title",
+                50,
+            )
+            .unwrap();
+        drop(legacy_engine);
+        assert!(
+            engine
+                .import_legacy_workspace_database(&legacy_db, 200)
+                .is_err()
+        );
+        assert!(
+            !engine
+                .import_legacy_workspace_database(ws.path().join("missing.db"), 201)
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    async fn cross_session_snapshot_isolation_empty_baseline_materializing_replay_and_bucket_isolation()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(".latte/state.db");
+        let conv_root = dir.path().join(".latte/conversations");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        std::fs::write(dir.path().join("shared.txt"), "v1\n").unwrap();
+
+        let engine = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .database_path(&db_path)
+            .conversation_root(&conv_root)
+            .permission_mode(latte_core::PermissionMode::FullAuto)
+            .build()
+            .unwrap();
+        let ids = latte_core::SystemIdSource::default();
+        let binding = test_session_binding();
+
+        let start_session = |sid: SessionId, tid: TurnId, now: u64| {
+            let snap = engine
+                .create_session_v2(sid, tid, binding.clone(), "s", now)
+                .unwrap();
+            let lease = engine.acquire_session_lease(sid, now, 10_000).unwrap();
+            let started = engine
+                .commit_session_turn_update(
+                    SessionCommitRequest {
+                        session_id: sid,
+                        turn_id: tid,
+                        expected_session_revision: snap.session_revision,
+                        expected_turn_revision: snap.turns[0].turn_revision,
+                        command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                        request_id: None,
+                        effect_id: None,
+                        update: CommitSessionTurnUpdate::Start {
+                            source_key: format!("start:{sid}"),
+                        },
+                    },
+                    &lease,
+                    now + 1,
+                )
+                .unwrap()
+                .snapshot;
+            (started, lease)
+        };
+
+        // 1. Cross-session snapshot isolation & frozen precondition (#2).
+        let sid_a = SessionId::from_uuid(ids.next_uuid_v7());
+        let tid_a = TurnId::from_uuid(ids.next_uuid_v7());
+        let (mut snap_a, lease_a) = start_session(sid_a, tid_a, 10);
+
+        let sid_b = SessionId::from_uuid(ids.next_uuid_v7());
+        let tid_b = TurnId::from_uuid(ids.next_uuid_v7());
+        let (mut snap_b, lease_b) = start_session(sid_b, tid_b, 20);
+
+        let sid_c = SessionId::from_uuid(ids.next_uuid_v7());
+        let tid_c = TurnId::from_uuid(ids.next_uuid_v7());
+        let (snap_c, lease_c) = start_session(sid_c, tid_c, 30);
+
+        let run_tool = |sid: SessionId,
+                        tid: TurnId,
+                        snap: &SessionSnapshot,
+                        lease: &Lease,
+                        eff_id: &str,
+                        name: &str,
+                        input: serde_json::Value,
+                        now: u64| {
+            let effect_id: latte_core::EffectId = eff_id.parse().unwrap();
+            let prep = engine
+                .prepare_or_reject_session_effect(
+                    SessionEffectRequest {
+                        session_id: sid,
+                        turn_id: tid,
+                        expected_session_revision: snap.session_revision,
+                        expected_turn_revision: snap.turns[0].turn_revision,
+                        command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                        source_key: format!("prep:{eff_id}"),
+                        authority: EffectAuthority {
+                            effect_id: effect_id.clone(),
+                            tool_call_id: eff_id.into(),
+                            name: name.into(),
+                            input,
+                            attempt: 1,
+                        },
+                    },
+                    lease,
+                    now,
+                )
+                .unwrap();
+            let SessionEffectPrepareOutcome::Prepared(prepared) = prep else {
+                panic!("expected Prepared for {eff_id}");
+            };
+            let started = engine
+                .start_session_effect(
+                    SessionEffectStartRequest {
+                        session_id: sid,
+                        turn_id: tid,
+                        expected_session_revision: prepared.snapshot.session_revision,
+                        expected_turn_revision: prepared.snapshot.turns[0].turn_revision,
+                        command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                        source_key: format!("start:{eff_id}"),
+                        effect_id,
+                    },
+                    prepared.operation_digest.clone(),
+                    lease,
+                    now + 1,
+                )
+                .unwrap();
+            (prepared, started)
+        };
+
+        // Session A reads v1.
+        let (_, started_read_a) = run_tool(
+            sid_a,
+            tid_a,
+            &snap_a,
+            &lease_a,
+            "a-read",
+            "read_file",
+            json!({"path": "shared.txt"}),
+            40,
+        );
+        let val_read_a = engine
+            .execute_started_session_effect(&started_read_a, &lease_a, &CancellationToken::new())
+            .await
+            .unwrap();
+        snap_a = engine
+            .observe_session_effect(
+                &started_read_a,
+                "obs:a-read".into(),
+                latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                val_read_a,
+                &lease_a,
+                42,
+            )
+            .unwrap()
+            .snapshot;
+
+        // Session C (which NEVER read shared.txt) cannot use A's snapshot!
+        let prep_c = engine
+            .prepare_or_reject_session_effect(
+                SessionEffectRequest {
+                    session_id: sid_c,
+                    turn_id: tid_c,
+                    expected_session_revision: snap_c.session_revision,
+                    expected_turn_revision: snap_c.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    source_key: "prep:c-write".into(),
+                    authority: EffectAuthority {
+                        effect_id: "c-write".parse().unwrap(),
+                        tool_call_id: "c-write".into(),
+                        name: "write_file".into(),
+                        input: json!({"path": "shared.txt", "content": "c-clobber\n"}),
+                        attempt: 1,
+                    },
+                },
+                &lease_c,
+                45,
+            )
+            .unwrap();
+        assert!(matches!(
+            prep_c,
+            SessionEffectPrepareOutcome::Rejected { .. }
+        ));
+
+        // Session B reads v1 and writes v2 (updating B's snapshot to v2).
+        let (_, started_read_b) = run_tool(
+            sid_b,
+            tid_b,
+            &snap_b,
+            &lease_b,
+            "b-read",
+            "read_file",
+            json!({"path": "shared.txt"}),
+            50,
+        );
+        let val_read_b = engine
+            .execute_started_session_effect(&started_read_b, &lease_b, &CancellationToken::new())
+            .await
+            .unwrap();
+        snap_b = engine
+            .observe_session_effect(
+                &started_read_b,
+                "obs:b-read".into(),
+                latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                val_read_b,
+                &lease_b,
+                52,
+            )
+            .unwrap()
+            .snapshot;
+        let (_, started_write_b) = run_tool(
+            sid_b,
+            tid_b,
+            &snap_b,
+            &lease_b,
+            "b-write",
+            "write_file",
+            json!({"path": "shared.txt", "content": "v2-from-B\n"}),
+            54,
+        );
+        let val_write_b = engine
+            .execute_started_session_effect(&started_write_b, &lease_b, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(val_write_b.success);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("shared.txt")).unwrap(),
+            "v2-from-B\n"
+        );
+
+        // Session A now attempts whole-file Write omitting `precondition`: A's frozen v1 digest
+        // MUST fail stale check and preserve B's `v2-from-B\n`!
+        let (_, started_write_a) = run_tool(
+            sid_a,
+            tid_a,
+            &snap_a,
+            &lease_a,
+            "a-write",
+            "write_file",
+            json!({"path": "shared.txt", "content": "stale-from-A\n"}),
+            60,
+        );
+        assert!(
+            started_write_a
+                .authority
+                .input
+                .get("precondition")
+                .is_some()
+        );
+        let val_write_a = engine
+            .execute_started_session_effect(&started_write_a, &lease_a, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            !val_write_a.success,
+            "Session A must receive stale error: {}",
+            val_write_a.result
+        );
+        assert!(val_write_a.result.contains("file changed since read"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("shared.txt")).unwrap(),
+            "v2-from-B\n"
+        );
+
+        // 2. Empty workspace with two mutating processes preserves initial `{}` baseline (#6).
+        #[cfg(unix)]
+        {
+            let empty_ws = tempfile::tempdir().unwrap();
+            let empty_eng = EngineBuilder::new()
+                .workspace_root(empty_ws.path())
+                .permission_mode(latte_core::PermissionMode::FullAuto)
+                .build()
+                .unwrap();
+            let empty_session = SessionId::from_uuid(ids.next_uuid_v7());
+            let empty_turn = TurnId::from_uuid(ids.next_uuid_v7());
+            let e_snap = empty_eng
+                .create_session_v2(empty_session, empty_turn, binding.clone(), "empty", 100)
+                .unwrap();
+            let e_lease = empty_eng
+                .acquire_session_lease(empty_session, 100, 10_000)
+                .unwrap();
+            let mut cur = empty_eng
+                .commit_session_turn_update(
+                    SessionCommitRequest {
+                        session_id: empty_session,
+                        turn_id: empty_turn,
+                        expected_session_revision: e_snap.session_revision,
+                        expected_turn_revision: e_snap.turns[0].turn_revision,
+                        command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                        request_id: None,
+                        effect_id: None,
+                        update: CommitSessionTurnUpdate::Start {
+                            source_key: "empty:start".into(),
+                        },
+                    },
+                    &e_lease,
+                    101,
+                )
+                .unwrap()
+                .snapshot;
+            for (idx, cmd) in ["printf 'new\n' > created.txt", "true"]
+                .into_iter()
+                .enumerate()
+            {
+                let eff: latte_core::EffectId = format!("p-{idx}").parse().unwrap();
+                let SessionEffectPrepareOutcome::Prepared(prep) = empty_eng
+                    .prepare_or_reject_session_effect(
+                        SessionEffectRequest {
+                            session_id: empty_session,
+                            turn_id: empty_turn,
+                            expected_session_revision: cur.session_revision,
+                            expected_turn_revision: cur.turns[0].turn_revision,
+                            command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                            source_key: format!("prep:{eff}"),
+                            authority: EffectAuthority {
+                                effect_id: eff.clone(),
+                                tool_call_id: eff.to_string(),
+                                name: "process".into(),
+                                input: json!({"shell": cmd}),
+                                attempt: 1,
+                            },
+                        },
+                        &e_lease,
+                        110 + idx as u64,
+                    )
+                    .unwrap()
+                else {
+                    panic!("expected Prepared");
+                };
+                let st = empty_eng
+                    .start_session_effect(
+                        SessionEffectStartRequest {
+                            session_id: empty_session,
+                            turn_id: empty_turn,
+                            expected_session_revision: prep.snapshot.session_revision,
+                            expected_turn_revision: prep.snapshot.turns[0].turn_revision,
+                            command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                            source_key: format!("start:{idx}"),
+                            effect_id: eff,
+                        },
+                        prep.operation_digest,
+                        &e_lease,
+                        120 + idx as u64,
+                    )
+                    .unwrap();
+                let obs = empty_eng
+                    .execute_started_session_effect(&st, &e_lease, &CancellationToken::new())
+                    .await
+                    .unwrap();
+                cur = empty_eng
+                    .observe_session_effect(
+                        &st,
+                        format!("obs:{idx}"),
+                        latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                        obs,
+                        &e_lease,
+                        130 + idx as u64,
+                    )
+                    .unwrap()
+                    .snapshot;
+            }
+            assert_eq!(
+                empty_eng.session_turn_changed_files(empty_turn).unwrap(),
+                vec!["created.txt".to_owned()],
+                "second no-op process must not overwrite empty initial baseline"
+            );
+        }
+
+        // 3. Crashed two-phase materializing session recovers command dedup + mode (#12),
+        //    and broken foreign workspace bucket does not block primary startup (#15).
+        let crash_session = SessionId::from_uuid(ids.next_uuid_v7());
+        let crash_turn = TurnId::from_uuid(ids.next_uuid_v7());
+        let crash_cmd = latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7());
+        let crash_lease = engine
+            .acquire_session_lease(crash_session, 200, 10_000)
+            .unwrap();
+        let prepared_mat = match engine
+            .storage
+            .begin_materializing_session_v2_with_mode(
+                &crash_cmd,
+                crash_session,
+                crash_turn,
+                &binding,
+                &engine.workspace_root,
+                "crash window prompt",
+                Some(latte_core::PermissionMode::AutoEdit),
+                latte_core::PermissionMode::AutoEdit,
+                &crash_lease,
+                201,
+                None,
+            )
+            .unwrap()
+        {
+            storage::BeginMaterializingOutcome::Prepared(p) => p,
+            storage::BeginMaterializingOutcome::Replayed => panic!("expected Prepared"),
+        };
+        engine
+            .conversation_store
+            .as_ref()
+            .unwrap()
+            .sync(
+                crash_session,
+                201,
+                std::slice::from_ref(&prepared_mat.user_entry),
+            )
+            .unwrap();
+        engine.release_lease(&crash_lease).unwrap();
+
+        #[cfg(unix)]
+        {
+            // Register a foreign workspace whose conversation bucket has a symlinked `.jsonl`.
+            let foreign_ws = tempfile::tempdir().unwrap();
+            let foreign_eng = EngineBuilder::new()
+                .workspace_root(foreign_ws.path())
+                .database_path(&db_path)
+                .conversation_root(&conv_root)
+                .build()
+                .unwrap();
+            let f_sid = SessionId::from_uuid(ids.next_uuid_v7());
+            foreign_eng
+                .create_session_v2(
+                    f_sid,
+                    TurnId::from_uuid(ids.next_uuid_v7()),
+                    binding.clone(),
+                    "foreign",
+                    205,
+                )
+                .unwrap();
+            let bad_sid = SessionId::from_uuid(ids.next_uuid_v7());
+            let foreign_bucket = foreign_eng
+                .conversation_store
+                .as_ref()
+                .unwrap()
+                .workspace_dir_for_test()
+                .to_path_buf();
+            std::os::unix::fs::symlink(
+                dir.path().join("shared.txt"),
+                foreign_bucket.join(format!("{bad_sid}.jsonl")),
+            )
+            .unwrap();
+            drop(foreign_eng);
+        }
+
+        drop(engine);
+
+        // Reopen primary workspace engine -> promotes `crash_session` with dedup + AutoEdit,
+        // and does NOT fail on the broken foreign workspace bucket!
+        let reopened = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .database_path(&db_path)
+            .conversation_root(&conv_root)
+            .build()
+            .unwrap();
+        assert_eq!(
+            reopened.session_permission_mode(crash_session),
+            latte_core::PermissionMode::AutoEdit
+        );
+        let replayed = reopened
+            .lookup_create_replay_with_mode(
+                &crash_cmd,
+                crash_session,
+                "crash window prompt",
+                &binding,
+                None,
+                Some(latte_core::PermissionMode::AutoEdit),
+            )
+            .unwrap()
+            .expect("promoted materializing session must replay original command_id");
+        assert_eq!(replayed.session_id, crash_session);
+        assert_eq!(
+            replayed.permission_mode,
+            latte_core::PermissionMode::AutoEdit
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    fn cross_process_permission_mode_switch_replace_all_summary_and_live_lease_materializing_retry()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared.db");
+        let conv_root = dir.path().join("conversations");
+        std::fs::write(dir.path().join("target.txt"), "alpha\nalpha\n").unwrap();
+
+        let engine_a = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .database_path(&db_path)
+            .conversation_root(&conv_root)
+            .build()
+            .unwrap();
+        let engine_b = EngineBuilder::new()
+            .workspace_root(dir.path())
+            .database_path(&db_path)
+            .conversation_root(&conv_root)
+            .build()
+            .unwrap();
+
+        // 1. `edit_file` permission card summary distinguishes replace_all vs single match.
+        let single_desc = session_effect_permission_summary(&descriptor(
+            "edit_file",
+            json!({"path":"target.txt","before":"alpha","after":"beta","replace_all":false}),
+        ));
+        assert!(single_desc.contains("replace one match"), "{single_desc}");
+        let all_desc = session_effect_permission_summary(&descriptor(
+            "edit_file",
+            json!({"path":"target.txt","before":"alpha","after":"beta","replace_all":true}),
+        ));
+        assert!(all_desc.contains("replace all matches"), "{all_desc}");
+
+        // 2. Cross-process permission_mode downgrade (FullAuto -> Ask) is observed
+        //    transactionally by Engine A even though Engine A originally created and
+        //    cached the session under FullAuto!
+        let ids = SystemIdSource::default();
+        let binding = test_session_binding();
+        let sid = SessionId::from_uuid(ids.next_uuid_v7());
+        let tid = TurnId::from_uuid(ids.next_uuid_v7());
+        let create_cmd = latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7());
+        let lease = engine_a.acquire_session_lease(sid, 100, 60_000).unwrap();
+        let created = match engine_a
+            .create_started_session_v2_with_mode(
+                &create_cmd,
+                sid,
+                tid,
+                binding.clone(),
+                "cross-process mode switch",
+                Some(latte_core::PermissionMode::FullAuto),
+                &lease,
+                101,
+                None,
+            )
+            .unwrap()
+        {
+            latte_core::CreateOutcome::Created(s) => s,
+            latte_core::CreateOutcome::Replayed(_) => panic!("expected Created"),
+        };
+        assert_eq!(
+            created.permission_mode,
+            latte_core::PermissionMode::FullAuto
+        );
+
+        // Process B switches the session to Ask without holding the lease.
+        let updated = engine_b
+            .set_session_permission_mode_v2(sid, latte_core::PermissionMode::Ask)
+            .unwrap();
+        assert_eq!(updated.permission_mode, latte_core::PermissionMode::Ask);
+        assert_eq!(
+            engine_a.session_permission_mode(sid),
+            latte_core::PermissionMode::Ask
+        );
+
+        // Engine A now prepares a write_file effect -> must enforce Ask, NOT FullAuto!
+        let prepared = engine_a
+            .prepare_session_effect(
+                SessionEffectRequest {
+                    session_id: sid,
+                    turn_id: tid,
+                    expected_session_revision: created.session_revision,
+                    expected_turn_revision: created.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    source_key: "test:cross-process-ask".into(),
+                    authority: descriptor(
+                        "write_file",
+                        json!({"path":"new_file.txt","content":"hello\n"}),
+                    ),
+                },
+                &lease,
+                105,
+            )
+            .unwrap();
+        assert_eq!(prepared.policy, SessionEffectPolicy::Ask);
+        assert_eq!(
+            prepared.snapshot.lifecycle,
+            latte_core::SessionLifecycle::WaitingPermission
+        );
+
+        // `.git/config` write_file is rejected before PrepareEffect in every mode!
+        engine_b
+            .set_session_permission_mode_v2(sid, latte_core::PermissionMode::FullAuto)
+            .unwrap();
+        let git_sid = SessionId::from_uuid(ids.next_uuid_v7());
+        let git_tid = TurnId::from_uuid(ids.next_uuid_v7());
+        let git_lease = engine_a
+            .acquire_session_lease(git_sid, 110, 60_000)
+            .unwrap();
+        let git_snap = match engine_a
+            .create_started_session_v2_with_mode(
+                &latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                git_sid,
+                git_tid,
+                binding.clone(),
+                "protect git metadata",
+                Some(latte_core::PermissionMode::FullAuto),
+                &git_lease,
+                111,
+                None,
+            )
+            .unwrap()
+        {
+            latte_core::CreateOutcome::Created(s) => s,
+            latte_core::CreateOutcome::Replayed(_) => panic!("expected Created"),
+        };
+        assert!(matches!(
+            engine_a.prepare_session_effect(
+                SessionEffectRequest {
+                    session_id: git_sid,
+                    turn_id: git_tid,
+                    expected_session_revision: git_snap.session_revision,
+                    expected_turn_revision: git_snap.turns[0].turn_revision,
+                    command_id: latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7()),
+                    source_key: "test:git-deny".into(),
+                    authority: descriptor(
+                        "write_file",
+                        json!({"path":".git/config","content":"[core]\nfsmonitor = evil\n"}),
+                    ),
+                },
+                &git_lease,
+                112,
+            ),
+            Err(StorageError::InvalidData(_))
+        ));
+
+        // 3. Crashed `materializing` session retried within the 60s lease TTL:
+        //    (a) fileless crash -> lookup clears orphaned row + dead lease (`Ok(None)`),
+        //        allowing immediate lease acquisition and creation without 409!
+        let now = wall_now_ms();
+        let fileless_sid = SessionId::from_uuid(ids.next_uuid_v7());
+        let fileless_tid = TurnId::from_uuid(ids.next_uuid_v7());
+        let fileless_cmd = latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7());
+        let dead_lease_1 = engine_a
+            .acquire_session_lease(fileless_sid, now, 60_000)
+            .unwrap();
+        engine_a
+            .storage
+            .begin_materializing_session_v2_with_mode(
+                &fileless_cmd,
+                fileless_sid,
+                fileless_tid,
+                &binding,
+                &engine_a.workspace_root,
+                "retry within 60s fileless",
+                Some(latte_core::PermissionMode::AutoEdit),
+                latte_core::PermissionMode::AutoEdit,
+                &dead_lease_1,
+                now,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            engine_b.lookup_create_replay_with_mode(
+                &fileless_cmd,
+                fileless_sid,
+                "mismatched prompt",
+                &binding,
+                None,
+                Some(latte_core::PermissionMode::AutoEdit),
+            ),
+            Err(StorageError::SessionCommandReplayMismatch)
+        ));
+        assert!(
+            engine_b
+                .lookup_create_replay_with_mode(
+                    &fileless_cmd,
+                    fileless_sid,
+                    "retry within 60s fileless",
+                    &binding,
+                    None,
+                    Some(latte_core::PermissionMode::AutoEdit),
+                )
+                .unwrap()
+                .is_none()
+        );
+        let retry_lease = engine_b
+            .acquire_session_lease(fileless_sid, now + 100, 60_000)
+            .expect("dead lease must be cleared so immediate retry succeeds");
+        let retried = engine_b
+            .create_started_session_v2_with_mode(
+                &fileless_cmd,
+                fileless_sid,
+                TurnId::from_uuid(ids.next_uuid_v7()),
+                binding.clone(),
+                "retry within 60s fileless",
+                Some(latte_core::PermissionMode::AutoEdit),
+                &retry_lease,
+                now + 101,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(retried, latte_core::CreateOutcome::Created(_)));
+
+        //    (b) `.jsonl`-backed crash within 60s lease -> lookup promotes and returns
+        //        `Some(snapshot)` AND clears dead lease so immediate follow-up lease succeeds!
+        let jsonl_sid = SessionId::from_uuid(ids.next_uuid_v7());
+        let jsonl_tid = TurnId::from_uuid(ids.next_uuid_v7());
+        let jsonl_cmd = latte_core::SessionCommandId::from_uuid(ids.next_uuid_v7());
+        let dead_lease_2 = engine_a
+            .acquire_session_lease(jsonl_sid, now, 60_000)
+            .unwrap();
+        let prepared_jsonl = match engine_a
+            .storage
+            .begin_materializing_session_v2_with_mode(
+                &jsonl_cmd,
+                jsonl_sid,
+                jsonl_tid,
+                &binding,
+                &engine_a.workspace_root,
+                "retry within 60s jsonl",
+                Some(latte_core::PermissionMode::FullAuto),
+                latte_core::PermissionMode::FullAuto,
+                &dead_lease_2,
+                now,
+                None,
+            )
+            .unwrap()
+        {
+            storage::BeginMaterializingOutcome::Prepared(p) => p,
+            storage::BeginMaterializingOutcome::Replayed => panic!("expected Prepared"),
+        };
+        engine_a
+            .conversation_store
+            .as_ref()
+            .unwrap()
+            .sync(
+                jsonl_sid,
+                now,
+                std::slice::from_ref(&prepared_jsonl.user_entry),
+            )
+            .unwrap();
+        let promoted_replay = engine_b
+            .lookup_create_replay_with_mode(
+                &jsonl_cmd,
+                jsonl_sid,
+                "retry within 60s jsonl",
+                &binding,
+                None,
+                Some(latte_core::PermissionMode::FullAuto),
+            )
+            .unwrap()
+            .expect("jsonl-backed materializing crash within 60s must promote and replay");
+        assert_eq!(promoted_replay.session_id, jsonl_sid);
+        assert_eq!(
+            promoted_replay.permission_mode,
+            latte_core::PermissionMode::FullAuto
+        );
+        engine_b
+            .acquire_session_lease(jsonl_sid, now + 200, 60_000)
+            .expect("promoting crashed materializing row must clear its dead lease");
     }
 }

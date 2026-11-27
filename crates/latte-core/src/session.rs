@@ -5,7 +5,9 @@
 //! reading its existing records byte-for-byte, while v2 consumers use the
 //! separate envelopes below.
 
-use crate::{SessionCommandId, SessionEventId, SessionId, TranscriptEntryId, TurnId};
+use crate::{
+    EffectId, ProjectKey, SessionCommandId, SessionEventId, SessionId, TranscriptEntryId, TurnId,
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -84,6 +86,89 @@ impl SessionLifecycle {
     }
 }
 
+/// Session-scoped permission posture enforced by `latte-engine`.
+///
+/// Hard safety boundaries (workspace path containment, symlink mutation
+/// refusal, `deny_globs`, and destructive command blocks) remain enforced
+/// unconditionally in every mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    /// Ask before file mutations and non-allowlisted process executions.
+    #[default]
+    Ask,
+    /// Auto-allow workspace-contained file mutations (`edit_file`, `write_file`);
+    /// continue asking for non-allowlisted process executions.
+    #[serde(alias = "auto-edit")]
+    AutoEdit,
+    /// Auto-allow workspace-contained file mutations and non-denied process executions.
+    #[serde(alias = "full-auto", alias = "auto")]
+    FullAuto,
+}
+
+impl PermissionMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::AutoEdit => "auto_edit",
+            Self::FullAuto => "full_auto",
+        }
+    }
+
+    #[must_use]
+    pub const fn cli_name(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::AutoEdit => "auto-edit",
+            Self::FullAuto => "full-auto",
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ask => "Ask",
+            Self::AutoEdit => "Auto-edit",
+            Self::FullAuto => "Full-auto",
+        }
+    }
+
+    #[must_use]
+    pub const fn card_label(self) -> &'static str {
+        match self {
+            Self::Ask => "Ask mode",
+            Self::AutoEdit => "Auto-edit mode",
+            Self::FullAuto => "Full-auto mode",
+        }
+    }
+
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Ask => Self::AutoEdit,
+            Self::AutoEdit => Self::FullAuto,
+            Self::FullAuto => Self::Ask,
+        }
+    }
+
+    /// Parses a user-supplied permission mode identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message when `value` is not a recognized mode.
+    pub fn parse_mode(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ask" => Ok(Self::Ask),
+            "auto_edit" | "auto-edit" | "autoedit" => Ok(Self::AutoEdit),
+            "full_auto" | "full-auto" | "fullauto" | "auto" => Ok(Self::FullAuto),
+            other => Err(format!(
+                "invalid permission mode `{other}`; expected `ask`, `auto-edit`, or `full-auto`"
+            )),
+        }
+    }
+}
+
 /// Outcome of a session create operation.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CreateOutcome<T = SessionSnapshot> {
@@ -143,7 +228,8 @@ pub enum ManualCompactionState {
     Compacted {
         tier: ManualCompactionTier,
         /// Session revision after the card append.
-        revision: u64,
+        #[serde(rename = "revision", alias = "session_revision")]
+        session_revision: u64,
     },
     /// Nothing to compact; the session is unchanged.
     NothingToCompact { reason: ManualCompactionIdleReason },
@@ -161,7 +247,9 @@ pub struct ManualCompactionResult {
 /// and generation are durable.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionProviderBinding {
-    pub version: u32,
+    /// Schema version of the provider-binding record itself (not the session protocol).
+    #[serde(rename = "version", alias = "binding_version")]
+    pub binding_version: u32,
     pub provider_name: String,
     pub provider_type: String,
     pub protocol: String,
@@ -219,7 +307,8 @@ pub struct SessionTurnSummary {
     pub turn_id: TurnId,
     #[serde(alias = "parent_run_id")]
     pub parent_turn_id: Option<TurnId>,
-    pub ordinal: u64,
+    #[serde(rename = "ordinal", alias = "turn_ordinal")]
+    pub turn_ordinal: u64,
     pub status: SessionTurnStatus,
     #[serde(alias = "run_revision")]
     pub turn_revision: u64,
@@ -304,9 +393,12 @@ pub struct SessionSnapshot {
     // break; this only deserializes persisted snapshots/results.
     #[serde(alias = "thread_id")]
     pub session_id: SessionId,
-    pub revision: u64,
+    #[serde(rename = "revision", alias = "session_revision")]
+    pub session_revision: u64,
     pub sequence: u64,
     pub lifecycle: SessionLifecycle,
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
     pub binding: SessionProviderBinding,
     // Always serialized (null when absent): this is a hard key rename only,
     // the wire shape must not change beyond the field name.
@@ -323,6 +415,15 @@ pub struct SessionSnapshot {
     pub focus: Option<String>,
 }
 
+/// Logical repository catalog record grouping linked Git worktrees.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSummary {
+    pub project_key: ProjectKey,
+    pub vcs_identity: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
 /// Bounded, transcript-free metadata used by Session catalog discovery.
 /// Provider credentials and executable effect data are intentionally absent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,6 +432,8 @@ pub struct SessionSummary {
     pub session_id: SessionId,
     pub title: String,
     pub workspace_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<ProjectKey>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -377,8 +480,7 @@ pub enum SessionPendingRequest {
     },
 }
 
-/// A versioned v2 command. It is isolated from `RuntimeCommand` so v1 JSON
-/// and persisted envelopes remain exactly compatible.
+/// A versioned v2 session command envelope.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCommandEnvelope {
     pub protocol_version: u16,
@@ -446,7 +548,8 @@ pub struct SessionEventEnvelope {
     pub event_id: SessionEventId,
     #[serde(alias = "thread_id")]
     pub session_id: SessionId,
-    pub revision: u64,
+    #[serde(rename = "revision", alias = "session_revision")]
+    pub session_revision: u64,
     pub sequence: u64,
     pub event: SessionEvent,
 }
@@ -474,7 +577,7 @@ pub enum SessionEvent {
     ReconciliationRequired {
         #[serde(alias = "run_id")]
         turn_id: TurnId,
-        effect_id: String,
+        effect_id: EffectId,
     },
 }
 
@@ -742,7 +845,7 @@ mod tests {
     #[test]
     fn session_protocol_rejects_invalid_binding_and_keeps_commands_versioned() {
         let binding = SessionProviderBinding {
-            version: 1,
+            binding_version: 1,
             provider_name: "provider".into(),
             provider_type: "openai-chat".into(),
             protocol: "chat".into(),
@@ -755,6 +858,24 @@ mod tests {
             credential_generation: 1,
         };
         assert!(binding.validate().is_ok());
+        // Read-only compatibility: persisted pre-Batch-3 bindings keyed `"version"`.
+        let legacy_binding = serde_json::json!({
+            "version": 1,
+            "provider_name": "provider",
+            "provider_type": "openai-chat",
+            "protocol": "chat",
+            "model": "model",
+            "config_fingerprint": "config",
+            "tools_fingerprint": "tools",
+            "aliases": {"read_file": "rf"},
+            "credential_ref_id": "keychain://main",
+            "data_scope_id": "workspace",
+            "credential_generation": 1
+        });
+        assert_eq!(
+            serde_json::from_value::<SessionProviderBinding>(legacy_binding).unwrap(),
+            binding
+        );
         let mut invalid = binding.clone();
         invalid.model = "\n".into();
         assert!(invalid.validate().is_err());
@@ -805,5 +926,61 @@ mod tests {
         assert_eq!(value["authorization"], "[REDACTED]");
         assert_eq!(value["nested"][1]["credential_id"], "[REDACTED]");
         assert_eq!(value["nested"][1]["safe"], "ok");
+    }
+
+    #[test]
+    fn permission_mode_cycles_parses_aliases_and_round_trips_serde() {
+        assert_eq!(PermissionMode::default(), PermissionMode::Ask);
+        assert_eq!(PermissionMode::Ask.next(), PermissionMode::AutoEdit);
+        assert_eq!(PermissionMode::AutoEdit.next(), PermissionMode::FullAuto);
+        assert_eq!(PermissionMode::FullAuto.next(), PermissionMode::Ask);
+
+        assert_eq!(PermissionMode::Ask.as_str(), "ask");
+        assert_eq!(PermissionMode::AutoEdit.as_str(), "auto_edit");
+        assert_eq!(PermissionMode::FullAuto.as_str(), "full_auto");
+
+        assert_eq!(PermissionMode::Ask.cli_name(), "ask");
+        assert_eq!(PermissionMode::AutoEdit.cli_name(), "auto-edit");
+        assert_eq!(PermissionMode::FullAuto.cli_name(), "full-auto");
+
+        assert_eq!(PermissionMode::Ask.label(), "Ask");
+        assert_eq!(PermissionMode::AutoEdit.label(), "Auto-edit");
+        assert_eq!(PermissionMode::FullAuto.label(), "Full-auto");
+
+        assert_eq!(PermissionMode::Ask.card_label(), "Ask mode");
+        assert_eq!(PermissionMode::AutoEdit.card_label(), "Auto-edit mode");
+        assert_eq!(PermissionMode::FullAuto.card_label(), "Full-auto mode");
+
+        for (raw, expected) in [
+            ("ask", PermissionMode::Ask),
+            ("ASK", PermissionMode::Ask),
+            ("auto-edit", PermissionMode::AutoEdit),
+            ("auto_edit", PermissionMode::AutoEdit),
+            ("autoedit", PermissionMode::AutoEdit),
+            ("full-auto", PermissionMode::FullAuto),
+            ("full_auto", PermissionMode::FullAuto),
+            ("fullauto", PermissionMode::FullAuto),
+            ("auto", PermissionMode::FullAuto),
+        ] {
+            assert_eq!(PermissionMode::parse_mode(raw).unwrap(), expected);
+        }
+        assert!(PermissionMode::parse_mode("yolo").is_err());
+
+        for mode in [
+            PermissionMode::Ask,
+            PermissionMode::AutoEdit,
+            PermissionMode::FullAuto,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(serde_json::from_str::<PermissionMode>(&json).unwrap(), mode);
+        }
+        assert_eq!(
+            serde_json::from_str::<PermissionMode>("\"auto-edit\"").unwrap(),
+            PermissionMode::AutoEdit
+        );
+        assert_eq!(
+            serde_json::from_str::<PermissionMode>("\"full-auto\"").unwrap(),
+            PermissionMode::FullAuto
+        );
     }
 }

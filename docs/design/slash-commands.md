@@ -1,11 +1,12 @@
 # 斜杠命令设计
 
-状态：**第一批 Built-in 已实现。**
+状态：**Built-in Catalog（含 `/compact`、`/cancel`）已实现。**
 
 Latte Code 目前由同一个 Built-in Catalog 驱动 `Ctrl+P` 与 Composer 的精确
-Slash Resolution。“当前实现状态”一节描述的 Session Command 已经落地；
-最小 Built-in Suggestion Popup 也已经实现。Fuzzy Matching、Prompt Command
-扩展、`/cancel` 与后续 Catalog Source 仍是目标设计。
+Slash Resolution。“当前实现状态”一节描述的 Session 与生命周期控制命令（含
+`/compact` 与 `/cancel`）已经落地；Built-in Suggestion Popup、`Tab` 补全与窗口化
+`Ctrl+P` Palette 也已经实现。Fuzzy Matching、Prompt Command 扩展与后续动态
+Catalog Source 仍是目标设计。
 
 ## 1. 参考实现结论
 
@@ -283,17 +284,16 @@ Trust Check。它们不会获得新的 Execution Kind。
 | `/new` | – | `LocalUi` | 不存在 Active Turn 或 Blocking Request | 切换到瞬态 `NewSessionDraft`，在第一条 Prompt 被接受前不创建 Durable Session。 |
 | `/sessions [query]` | `/resume` | `TypedAction` 加本地 Picker | 不存在 Active Turn 或 Blocking Request | 无参数时加载并打开当前 Workspace 的 Session Picker；携带 ID 或标题 Query 时直接解析并打开该 Session。 |
 
-`/new` 不会修改当前 Session。TUI 需要显式的 Active
-Conversation Target，例如：
+`/new` 不会修改当前 Session。TUI 使用显式的 Active Session Target：
 
 ```rust
-pub enum ActiveConversation {
-    NewSessionDraft,
-    Session(SessionId),
+pub enum ActiveSession {
+    SessionDraft,
+    Existing(SessionId),
 }
 ```
 
-进入 `NewSessionDraft` 只清空新 Draft Composer 与本地 Selection State；原
+进入 `SessionDraft` 只清空新 Draft Composer 与本地 Selection State；原
 Session 仍然可以发现。它的第一个 Prompt 使用正常 Start Path，并遵守数据存储
 设计的 Commit Point：Prompt 通过本地校验并被接受时，先创建 Session Row 与 User
 Content，再构造或调用 Provider。
@@ -324,8 +324,8 @@ Active Run。
 | `/cancel` | – | `TypedAction` | 对可取消 Active Run 发出 `Cancel { session_id }`。 |
 | `/quit` | `/exit`、`/q` | `TypedAction` | 发出 `Quit`。 |
 
-后续 Built-in 中 `/rename` 与 `/fork` 已进入 Catalog（见第 15 节）；`/status`、
-`/compact`、`/permissions` 和 `/diff` 仍为候选，前提是每个命令都有 Typed Service
+后续 Built-in 中 `/rename`、`/fork`、`/compact` 与 `/cancel` 均已进入 Catalog（见第 15 节）；`/status`、
+`/permissions` 和 `/diff` 仍为候选，前提是每个命令都有 Typed Service
 Contract 与 Lifecycle Policy。Prompt Expansion 可用后，`/init` 和 `/review` 应作为第一批
 Built-in `PromptTemplate` Command。
 
@@ -341,7 +341,7 @@ latte-tui/src/command.rs
   built-in identifiers, descriptors, parser, catalog matching, availability
 
 latte-tui/src/session.rs
-  popup state, ActiveConversation, Session picker, reducer integration,
+  popup state, ActiveSession, Session picker, reducer integration,
   rendering, typed action emission
 
 latte-core/src/command.rs             (future PromptTemplate phase)
@@ -423,7 +423,7 @@ Palette 共用的唯一 Catalog。它只保存 Identifier 与无密钥 Metadata�
 
 | 命令 | Alias | Kind | 当前结果 |
 | --- | --- | --- | --- |
-| `/new` | – | `LocalUi` | 启动新的瞬态 Draft。 |
+| `/new` | – | `LocalUi` | 启动新的瞬态 Session Draft。 |
 | `/sessions [query]` | `/resume` | `TypedAction` | 打开当前 Workspace Picker、搜索该 Workspace，或按 ID 精确恢复。 |
 | `/rename <title>` | – | `TypedAction` | 重命名当前已保存 Session。 |
 | `/fork [title]` | `/branch` | `TypedAction` | 把已提交对话历史复制到不携带运行时 Authority 的新 Session。 |
@@ -432,6 +432,8 @@ Palette 共用的唯一 Catalog。它只保存 Identifier 与无密钥 Metadata�
 | `/navigation` | `/nav` | `LocalUi` | 进入 Transcript Navigation。 |
 | `/refresh` | – | `TypedAction` | 重新加载权威 Projection。 |
 | `/quit` | `/exit`、`/q` | `LocalUi` | 退出 Terminal UI。 |
+| `/compact` | – | `TypedAction` | 仅在已打开的空闲（`Ready`）Session 上触发手动上下文压缩，完成后刷新权威快照与 `ContextUsage` meter。 |
+| `/cancel` | – | `TypedAction` | 仅在存在活跃 Turn 时发出类型化 `Cancel { session_id }`，不触发 `Ctrl+C` 二次退出计时器。 |
 
 只有第一个 Byte 是 `/` 的 Composer Text 才是 Command Candidate。Built-in
 Name 和 Alias 使用小写 ASCII 并精确匹配；Argument 保留内部换行，只裁剪外层
@@ -461,19 +463,22 @@ Composer。若 Follow-up 在 Child Active 时进入 Queue，但 Child 在它被�
 已脱敏 Content，而不是只比较展示文本。
 
 Composer 现在会针对 `/` 与单 Token 前缀打开锚定在 Composer 上方的 Built-in
-Suggestion Popup。它按 Canonical Name 与 Alias Prefix 匹配，并以稳定的
-Exact/Canonical/Alias 顺序排列；Up/Down 在有界结果内选择，Enter 复用正常的
-Availability 二次检查后 Dispatch，Esc 只关闭 Popup 而不修改 Draft，后续编辑会
-重新打开。Blocking Request State 继续拥有完整 Key Event；其他 Overlay 也会隐藏
-Popup。
+Suggestion Popup，并与窗口化滚动的 `Ctrl+P` Palette 共用同一套 `command_availability`
+判定与 Disabled Reason 展示。它按 Canonical Name 与 Alias Prefix 匹配，并以稳定的
+Exact/Canonical/Alias 顺序排列；Up/Down 在有界结果内选择，`Tab` 补全 Canonical
+Name（支持参数时追加空格），选择必填参数命令（如 `/rename`）时仅补全到 Composer
+而不直接执行，Enter 复用正常的 Availability 二次检查后 Dispatch，Esc 只关闭 Popup
+而不修改 Draft，后续编辑会重新打开。`WaitingPermission`、`WaitingInput` 与
+`ReconciliationRequired` 等阻塞态继续拥有完整 Key Event 并关闭命令浮层。
 
 Fuzzy Matching、Dynamic Prompt Command、Workspace Command File、MCP Prompt、
-Skill、可执行 Plugin、显式 Cross-workspace Rebinding 与 Slash `/cancel` 尚未实现。
+Skill、可执行 Plugin 与显式 Cross-workspace Rebinding 尚未实现。
 
-Reducer Test 覆盖 Popup Filter、键盘选择、Dismiss、Blocking、Local、Typed 与
-普通 Prompt Path、Alias、精确 Argument、禁用的切换和 Draft 保留。最终二进制
+Reducer Test 覆盖 Popup Filter、`Tab` 补全、键盘选择、Dismiss、Blocking、Local、Typed 与
+普通 Prompt Path、Alias、精确 Argument、禁用的切换、`/compact`、`/cancel` 与 Draft 保留。最终二进制
 PTY E2E 覆盖 Popup Rendering、方向键 Navigation、Prefix Filter、Session 创建、
-`/resume <session-id>`、`/new`、Provider/Model 切换、下一次 Wire Request 使用所选
+`/resume <session-id>`、`/new`、`/compact`（含空态、有效压缩与幂等重入）、`/cancel`
+（含保持 TUI 存活且不触发 `Ctrl+C` 退出武装）、Provider/Model 切换、下一次 Wire Request 使用所选
 Model，以及纯本地路径不会触发额外 Provider Request。
 
 ## 16. 交付阶段

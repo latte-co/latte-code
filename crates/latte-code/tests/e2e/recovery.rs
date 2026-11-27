@@ -536,7 +536,7 @@ fn failed_verification_is_durable_and_never_claims_completion() {
         server.resolve_permission(&session_id, &request_id, revision, turn_revision, true);
     assert_eq!(allow_status, 200, "allow: {allow_body:?}");
     let terminal = server.wait_for_terminal(&session_id);
-    assert_eq!(terminal["lifecycle"], "failed");
+    assert_eq!(terminal["lifecycle"], "ready");
     assert_eq!(terminal["turns"][0]["status"], "failed");
     assert_eq!(
         std::fs::read_to_string(scenario.root().join("new.txt")).unwrap(),
@@ -568,4 +568,109 @@ fn failed_verification_is_durable_and_never_claims_completion() {
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
     assert_tool_result_reached_provider(&requests[1].body);
+}
+
+#[test]
+fn observed_write_file_missing_jsonl_tool_result_repairs_without_remutating_workspace() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([
+        write_file_reply("repair-write-1"),
+        ProviderReply::input_request("after-write", "Confirm handoff?", false),
+    ]);
+    scenario.write_config_with_provider_fields(
+        provider.endpoint(),
+        r#"["/bin/pwd"]"#,
+        ".latte/latte-code.db",
+        ",compatibility_input_request:true",
+    );
+
+    let session_id = {
+        let server = ServerChild::start(&scenario);
+        let workspace = server.create_workspace(&scenario);
+        let binding = server_binding(&scenario);
+        let session_id = server.create_session(&workspace, "write then pause", &binding);
+        let (revision, request_id, turn_revision) = server.wait_for_permission(&session_id);
+        let (allow_status, allow_body) =
+            server.resolve_permission(&session_id, &request_id, revision, turn_revision, true);
+        assert_eq!(allow_status, 200, "allow: {allow_body:?}");
+        for _ in 0..200 {
+            let snap = server.snapshot(&session_id);
+            if snap["lifecycle"].as_str() == Some("waiting_input") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            server.snapshot(&session_id)["lifecycle"].as_str(),
+            Some("waiting_input")
+        );
+        session_id
+    };
+
+    let target_file = scenario.root().join("new.txt");
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        "created by e2e\n"
+    );
+    // Overwrite the file on disk after the effect was observed; repairing the
+    // missing JSONL `ToolResult` must never re-execute `write_file`.
+    std::fs::write(&target_file, "user-edited-after-tool\n").unwrap();
+
+    let files = scenario.session_files();
+    assert_eq!(files.len(), 1);
+    let jsonl_path = &files[0];
+    let original = std::fs::read_to_string(jsonl_path).unwrap();
+    let stripped: Vec<&str> = original
+        .lines()
+        .filter(|line| !line.contains(r#""kind":"tool_result""#))
+        .collect();
+    assert!(stripped.len() < original.lines().count());
+    std::fs::write(jsonl_path, format!("{}\n", stripped.join("\n"))).unwrap();
+
+    let shown = scenario.output(&["--json", "show", &session_id], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "e2e-server-secret");
+    });
+    assert!(shown.status.success());
+    let entries = json(&shown)["data"]["session"]["transcript"]["entries"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(entries.iter().any(|entry| {
+        entry["kind"] == "tool_result" && entry["payload"]["tool_call_id"] == "repair-write-1"
+    }));
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        "user-edited-after-tool\n",
+        "repairing missing ToolResult must never re-execute write_file"
+    );
+    provider.assert_consumed();
+}
+
+#[test]
+fn orphaned_jsonl_symlink_in_session_bucket_fails_closed() {
+    let scenario = Scenario::new();
+    let provider = ScriptedProvider::start([ProviderReply::completion("symlink baseline")]);
+    scenario.write_config(provider.endpoint(), r#"["/bin/pwd"]"#);
+    let initial = scenario.output(&["--json", "run", "seed session bucket"], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "symlink-secret");
+    });
+    assert!(initial.status.success());
+
+    let files = scenario.session_files();
+    assert_eq!(files.len(), 1);
+    let jsonl_path = files[0].clone();
+    let outside_target = scenario.home().join("outside-target.jsonl");
+    std::fs::rename(&jsonl_path, &outside_target).unwrap();
+    std::os::unix::fs::symlink(&outside_target, &jsonl_path).unwrap();
+
+    let db_path = scenario.database_path();
+    std::fs::remove_file(&db_path).unwrap();
+    let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
+
+    let listed = scenario.output(&["--json", "list"], |cmd| {
+        cmd.env("TEST_OPENAI_KEY", "symlink-secret");
+    });
+    assert_eq!(listed.status.code(), Some(70));
+    assert_eq!(json(&listed)["error"]["code"], "internal");
 }

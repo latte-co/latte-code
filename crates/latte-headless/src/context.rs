@@ -8,6 +8,7 @@ pub struct ContextBundle {
     pub truncated: bool,
     pub sources: Vec<String>,
 }
+#[allow(clippy::too_many_lines)]
 pub fn build(
     root: &Path,
     focus: Option<&Path>,
@@ -15,9 +16,13 @@ pub fn build(
 ) -> Result<ContextBundle, std::io::Error> {
     let root = fs::canonicalize(root)?;
     let mut paths = Vec::new();
-    let root_agents = root.join("AGENTS.md");
-    if root_agents.is_file() {
-        paths.push(contained_canonical(&root, &root_agents)?)
+    for doc_name in ["AGENTS.md", "CLAUDE.md"] {
+        let root_doc = root.join(doc_name);
+        if let Some(canonical) = safe_contained_file(&root, &root_doc)
+            && !paths.contains(&canonical)
+        {
+            paths.push(canonical);
+        }
     }
     if let Some(focus) = focus {
         if focus.as_os_str().is_empty()
@@ -62,9 +67,14 @@ pub fn build(
                     "focus escapes workspace",
                 ));
             }
-            let candidate = dir.join("AGENTS.md");
-            if candidate.is_file() && !paths.contains(&candidate) {
-                nested.push(contained_canonical(&root, &candidate)?)
+            for doc_name in ["CLAUDE.md", "AGENTS.md"] {
+                let candidate = dir.join(doc_name);
+                if let Some(canonical) = safe_contained_file(&root, &candidate)
+                    && !paths.contains(&canonical)
+                    && !nested.contains(&canonical)
+                {
+                    nested.push(canonical);
+                }
             }
             if dir == root {
                 break;
@@ -76,10 +86,10 @@ pub fn build(
     }
     for name in ["Cargo.toml", "package.json", "pyproject.toml", "go.mod"] {
         let path = root.join(name);
-        if path.is_file() {
-            // Same containment as AGENTS.md: a root manifest that is a
-            // symlink pointing outside the workspace must not be read.
-            paths.push(contained_canonical(&root, &path)?)
+        if let Some(canonical) = safe_contained_file(&root, &path)
+            && !paths.contains(&canonical)
+        {
+            paths.push(canonical);
         }
     }
     let mut text = String::new();
@@ -106,6 +116,16 @@ pub fn build(
         text.push_str(&section);
         sources.push(relative)
     }
+    if !truncated
+        && cap >= 512
+        && let Some(overview) = build_workspace_overview(&root)
+    {
+        let section = format!("\n--- workspace overview ---\n{overview}");
+        let remaining = cap.saturating_sub(text.len());
+        if section.len() <= remaining {
+            text.push_str(&section);
+        }
+    }
     Ok(ContextBundle {
         text,
         truncated,
@@ -120,12 +140,88 @@ fn focus_escape() -> std::io::Error {
     )
 }
 
-fn contained_canonical(root: &Path, path: &Path) -> Result<PathBuf, std::io::Error> {
-    let canonical = fs::canonicalize(path)?;
-    if !canonical.starts_with(root) {
-        return Err(focus_escape());
+fn safe_contained_file(root: &Path, path: &Path) -> Option<PathBuf> {
+    let canonical = fs::canonicalize(path).ok()?;
+    if !canonical.starts_with(root) || !canonical.is_file() {
+        return None;
     }
-    Ok(canonical)
+    Some(canonical)
+}
+
+fn read_safe_git_head(root: &Path) -> Option<String> {
+    use std::io::Read;
+    let git_dir = root.join(".git");
+    let git_meta = fs::symlink_metadata(&git_dir).ok()?;
+    if git_meta.file_type().is_symlink() || !git_meta.file_type().is_dir() {
+        return None;
+    }
+    let head_path = git_dir.join("HEAD");
+    let head_meta = fs::symlink_metadata(&head_path).ok()?;
+    if head_meta.file_type().is_symlink() || !head_meta.file_type().is_file() {
+        return None;
+    }
+    let canonical = safe_contained_file(root, &head_path)?;
+    let file = fs::File::open(canonical).ok()?;
+    let mut bytes = Vec::with_capacity(256);
+    file.take(256).read_to_end(&mut bytes).ok()?;
+    let text = std::str::from_utf8(&bytes).ok()?.trim();
+    if let Some(branch) = text.strip_prefix("ref: refs/heads/") {
+        if !branch.is_empty()
+            && branch.len() <= 200
+            && !branch.contains("..")
+            && !branch.starts_with('/')
+            && !branch.ends_with('/')
+            && branch
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.'))
+        {
+            return Some(format!("git_branch: {branch}"));
+        }
+        return None;
+    }
+    if (40..=64).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(format!("git_head: {}", &text[..12]));
+    }
+    None
+}
+
+fn build_workspace_overview(root: &Path) -> Option<String> {
+    let mut lines = Vec::new();
+    if let Some(head_line) = read_safe_git_head(root) {
+        lines.push(head_line);
+    }
+    if let Ok(read_dir) = fs::read_dir(root) {
+        let mut entries = Vec::new();
+        for entry in read_dir.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if matches!(
+                name.as_str(),
+                ".git" | ".latte" | ".oh-my-code" | ".opencode" | ".worktree" | ".tmp" | "target"
+            ) {
+                continue;
+            }
+            let suffix = match entry.file_type() {
+                Ok(ft) if ft.is_dir() => "/",
+                Ok(ft) if ft.is_symlink() => "@",
+                _ => "",
+            };
+            entries.push(format!("{name}{suffix}"));
+        }
+        entries.sort();
+        if !entries.is_empty() {
+            let total = entries.len();
+            entries.truncate(60);
+            let mut listing = entries.join(", ");
+            if total > 60 {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut listing,
+                    format_args!(", … (+{} more)", total - 60),
+                );
+            }
+            lines.push(format!("top_level: {listing}"));
+        }
+    }
+    (!lines.is_empty()).then(|| format!("{}\n", lines.join("\n")))
 }
 #[cfg(test)]
 mod tests {
@@ -198,7 +294,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rejects_external_symlinked_manifests() {
+    fn skips_external_symlinked_manifests_without_reading_external_secrets() {
         use std::os::unix::fs::symlink;
 
         for name in ["Cargo.toml", "package.json", "pyproject.toml", "go.mod"] {
@@ -206,17 +302,15 @@ mod tests {
             let external = tempfile::tempdir().unwrap();
             fs::write(external.path().join(name), "external secret").unwrap();
             symlink(external.path().join(name), workspace.path().join(name)).unwrap();
-            assert_eq!(
-                build(workspace.path(), None, 1024).unwrap_err().kind(),
-                std::io::ErrorKind::PermissionDenied,
-                "{name} symlinked out of the workspace must be rejected"
-            );
+            let bundle = build(workspace.path(), None, 1024).unwrap();
+            assert!(!bundle.sources.iter().any(|s| s == name));
+            assert!(!bundle.text.contains("external secret"));
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn rejects_external_symlink_ancestors_and_agents_files() {
+    fn rejects_external_symlink_focus_ancestors_and_skips_external_agents_or_claude_files() {
         use std::os::unix::fs::symlink;
 
         let workspace = tempfile::tempdir().unwrap();
@@ -236,16 +330,75 @@ mod tests {
         );
 
         fs::create_dir(workspace.path().join("safe")).unwrap();
+        fs::write(workspace.path().join("CLAUDE.md"), "claude root guide").unwrap();
         symlink(
             external.path().join("AGENTS.md"),
             workspace.path().join("safe/AGENTS.md"),
         )
         .unwrap();
-        assert_eq!(
-            build(workspace.path(), Some(Path::new("safe/file.rs")), 1024)
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::PermissionDenied
+        let bundle = build(workspace.path(), Some(Path::new("safe/file.rs")), 1024).unwrap();
+        assert_eq!(bundle.sources, vec!["CLAUDE.md"]);
+        assert!(bundle.text.contains("claude root guide"));
+        assert!(!bundle.text.contains("external secret"));
+    }
+
+    #[test]
+    fn workspace_overview_validates_git_head_and_rejects_symlinks_and_non_utf8_slices() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\n",
+        )
+        .unwrap();
+        fs::create_dir(workspace.path().join(".git")).unwrap();
+
+        // Valid symbolic ref.
+        fs::write(
+            workspace.path().join(".git/HEAD"),
+            "ref: refs/heads/feat/safe-head\n",
+        )
+        .unwrap();
+        let branch_bundle = build(workspace.path(), None, 4096).unwrap();
+        assert!(
+            branch_bundle.text.contains("git_branch: feat/safe-head"),
+            "{}",
+            branch_bundle.text
         );
+
+        // Valid 40-hex detached OID.
+        fs::write(
+            workspace.path().join(".git/HEAD"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .unwrap();
+        let oid_bundle = build(workspace.path(), None, 4096).unwrap();
+        assert!(
+            oid_bundle.text.contains("git_head: 0123456789ab"),
+            "{}",
+            oid_bundle.text
+        );
+
+        // Multi-byte UTF-8 where raw `&head[..12]` would split a 4-byte codepoint, plus arbitrary secret text.
+        for bad_head in ["😀😀😀😀😀\n", "super-secret-outside-line-123456\n"] {
+            fs::write(workspace.path().join(".git/HEAD"), bad_head).unwrap();
+            let bad_bundle = build(workspace.path(), None, 4096).unwrap();
+            assert!(!bad_bundle.text.contains("git_branch:"));
+            assert!(!bad_bundle.text.contains("git_head:"));
+            assert!(!bad_bundle.text.contains("super-secret"));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = tempfile::tempdir().unwrap();
+            let secret_head = outside.path().join("HEAD");
+            fs::write(&secret_head, "ref: refs/heads/leaked-outside-branch\n").unwrap();
+            fs::remove_file(workspace.path().join(".git/HEAD")).unwrap();
+            symlink(&secret_head, workspace.path().join(".git/HEAD")).unwrap();
+            let sym_bundle = build(workspace.path(), None, 4096).unwrap();
+            assert!(!sym_bundle.text.contains("leaked-outside-branch"));
+            assert!(!sym_bundle.text.contains("git_branch:"));
+            assert!(!sym_bundle.text.contains("git_head:"));
+        }
     }
 }

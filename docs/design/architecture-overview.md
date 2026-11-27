@@ -1,6 +1,6 @@
 # Rust 架构
 
-完成操作在持有引擎 operation gate 时执行稳定的 A/B 工作区快照。快照 B 是进入原子数据库提交前的验证线性化点。Handoff 会保存 B 的 manifest 摘要与验证时间；B 之后发生的变化不属于已验证内容，下游可通过重新计算 manifest 检测漂移。符号链接以拓扑记录参与摘要，不安全或采样期间不稳定的链接会失败关闭。
+完成操作默认采用基于事务内已执行变更 Effect 的按需追踪（问答与只读轮次零全盘扫描，工作区内外部/悬空符号链接不阻塞会话创建，并在工具访问层严格拦截越界读写）；仅在执行可变子进程或配置了显式验证时捕获必要的定向快照。Handoff 保存变更文件列表与验证证据。
 
 工作区 manifest 的路径和符号链接 target 必须是有效 UTF-8。无法表示为 UTF-8 的操作系统路径字节会失败关闭，绝不会通过替换字符折叠成有损的 manifest key。
 Manifest key 使用 JSON 序列化精确的 UTF-8 路径 component 数组，不会归一化分隔符。因此 Unix 文件名中的字面反斜杠与嵌套路径始终不同。
@@ -29,7 +29,7 @@ latte-code CLI/TUI/Server
 
 Session v2 是增量协议：v1 的 `RunState`、命令、事件和协议版本保持字节兼容。迁移 7 新增独立的 `threads_v2`、关联 child run、唯一的 `thread_active_runs_v2` active authority、可分页的类型化 transcript card、独立的 thread 事件流，以及脱敏后的 command/source 去重；迁移 8 新增仅 engine 可读的 canonical effect descriptor 表；迁移 9 新增有界 Session Catalog Metadata（`title` 和规范化的 `workspace_root`）；迁移 10 新增 Session Scoped Runtime Lease，同时保持 Fencing Token 全局单调；迁移 11 新增全局 Project/Workspace 注册、Session 血缘元数据和 Legacy Import Fingerprint。JSONL 是唯一持久化 Transcript 读取权威；SQLite 的 `conversation_outbox` 只在已接受记录尚未 fsync 到 JSONL 时提供事务缓冲，成功同步后立即删除。关联 child 不能调用 legacy transition、checkpoint、process 或 tool mutation API；其状态、事件与 transcript 必须通过带 lease/fence 的 `CommitSessionTurnUpdate`（schema 15 前名 `CommitSessionRunUpdate`）原子提交，未挂 Session 的 turn 仍由 `reject_linked_turn` 12+ 处守卫拦截（见 `docs/design/concept-alignment.md` §3，守卫不随改名退役）。
 
-> 命名更新：上述迁移叙述保留了当时的名字（`threads_v2` / Run / `CommitSessionRunUpdate`）。schema 13 已把 Thread 改名 Session（`threads_v2 → sessions`），schema 15 已把物理图与领域类型 Run 改名 Turn（`runs → turns`、`RunState → TurnState`），schema 14 增加持久轮次计数器 `tool_round_count`；线协议字段 `run_id → turn_id` 硬改名，旧持久化数据只读兼容（serde alias、JSONL `run_id` 回退、legacy import）。
+> 命名更新：上述迁移叙述保留了当时的名字（`threads_v2` / Run / `CommitSessionRunUpdate`）。schema 13 已把 Thread 改名 Session（`threads_v2 → sessions`），schema 14 增加持久轮次计数器 `tool_round_count`，schema 15 已把物理图与领域类型 Run 改名 Turn（`runs → turns`、`RunState → TurnState`），schema 16 增加按会话持久化的 `permission_mode`、两阶段创建幂等命令身份（`create_command_id` / `create_command_digest`）与显式基线采集标记 `turn_baselines.captured`；线协议 `/v1` 保持 `revision` / `ordinal` / `version` 兼容并新增 `permission_mode`，旧持久化数据只读兼容（serde alias、JSONL `run_id` 回退、legacy import）。
 
 运行写入必须携带有效 owner lease 与单调递增的 fencing token。lease 过期后即使同一 owner 重新获取也会推进 epoch；接管后旧 owner 不能再写入。
 
@@ -55,7 +55,7 @@ Declared -> Prepared -> Started -> ObservedSuccess | ObservedFailed | Unknown
 
 终端将一个聚焦 conversation 呈现为单一 transcript viewport，并固定显示多行 composer；不再提供 session 侧栏或 session overlay。空状态在宽且高的 viewport 中并排展示产品标识与已解析环境，在更小宽度下才有意堆叠；首次输入后，紧凑 header 展示已解析的工作区路径，不虚构 branch 或仓库指标。纯展示投影按 child run 对持久化 card 分组，并在存在公开 `tool_call_id` 时配对 tool-call/tool-result card。活动层级最多三层：真实的 run/status 标题、tool action 和可选 result detail；展开 detail 只展示有界且脱敏的 target/query/command 结构化元数据。权限展示从持久化的脱敏 descriptor 与摘要中分别派生 operation、target 和 scope。Completion card 携带脱敏 handoff payload，使 changed files 与 verification evidence 在重启后仍可由 TUI 展示。投影不渲染私有 checkpoint 数据或原始 payload JSON。Session 投影携带最近的、最多 500 条 card，而不是最早的一页；若更早 card 被省略，transcript 会明确提示。
 
-Composer 模式拥有包括 `q`、`s`、`j`、`k` 和 `?` 在内的全部可打印字符。Enter 发送非空 composer 或待补充输入，Shift+Enter 插入换行；空状态 composer 还会展示 Ctrl+Enter 这一兼容发送组合键，F5 则仍不对外展示。Unicode grapheme cluster 按整体编辑，CJK 与 emoji 的换行、对齐和光标位置按终端显示宽度计算。Ctrl+P 打开本地命令面板，其中 help、navigation、refresh 与 quit 复用对应快捷键使用的安全 UI 状态或类型化 action。终端会在支持时启用渐进式键盘消歧、bracketed paste 与鼠标捕获，并在所有退出路径恢复原模式；鼠标滚轮可以滚动 transcript 历史。按 Esc 才会显式进入 transcript Navigation 模式，此时 `j`/`k` 选择 action，PageUp/PageDown 滚动，Enter/Space 展开或折叠选中 action，可打印的 `q` 退出；F10 是两个模式都可使用的显式退出键。第一次 Ctrl+C 会中断活动任务并进入退出确认，2 秒内再次按 Ctrl+C 才退出；超时或按下其他键会解除确认。待决权限会以固定在瀑布流当前尾部、紧邻 composer 上方的内联 card，展示有边界、过滤控制字符且脱敏的操作摘要（写入目标/内容意图、进程 argv/cwd 或读取/调用目标）。权限与 reconciliation 分支会消费完整 key event：只有精确聚焦请求上的 `d` 或 Ctrl+A 能作出决定，Enter 和 Shift+Enter 都不能批准、确认或修改任何文本缓冲。事件缺口或重连会清空瞬态进度，并由 projection adapter 内部重新加载权威 snapshot。事件循环仅在投影或本地状态变化后重绘。Child 运行时，Enter 可以把有界 Follow-up 加入进程内 Mailbox；每个 Session 的单 Runner 只在当前 Child 到达可运行边界后按 FIFO 消费用户输入，不同 Session 使用独立 Runner。
+Composer 模式拥有包括 `q`、`s`、`j`、`k` 和 `?` 在内的全部可打印字符，并维护 grapheme 级光标（支持方向键、`Home`/`End`、`Delete`、`Ctrl+W`/`Ctrl+U` 及输入历史回溯）。Enter 发送非空 composer 或待补充输入，`Shift+Enter`、`Alt+Enter` 与 `Ctrl+J` 均可插入换行；空状态 composer 还会展示 Ctrl+Enter 这一兼容发送组合键，F5 则仍不对外展示。Unicode grapheme cluster 按整体编辑，CJK 与 emoji 的换行、对齐和光标位置按终端显示宽度计算。`Shift+Tab` 或 `/mode` 可在 `Ask`、`Auto-edit`、`Full auto` 三档会话权限模式间切换。Ctrl+P 打开本地命令面板，其中 help、navigation、refresh 与 quit 复用对应快捷键使用的安全 UI 状态或类型化 action。终端会在支持时启用渐进式键盘消歧与 bracketed paste，默认不开启鼠标捕获以保留终端原生鼠标拖选复制（可通过 `LATTE_TUI_MOUSE_CAPTURE=1` 显式开启滚轮捕获），并在所有退出路径恢复原模式。按 Esc 才会显式进入 transcript Navigation 模式，此时 `j`/`k` 选择 action，PageUp/PageDown 滚动，Enter/Space 展开或折叠选中 action，可打印的 `q` 退出；F10 是两个模式都可使用的显式退出键。第一次 Ctrl+C 会中断活动任务并进入退出确认，2 秒内再次按 Ctrl+C 才退出；超时或按下其他键会解除确认。待决权限会以固定在瀑布流当前尾部、紧邻 composer 上方的内联 card，展示有边界、过滤控制字符且脱敏的操作摘要与带颜色的 unified diff / 完整命令预览。权限与 reconciliation 分支会消费完整 key event：权限卡片可通过 `y`/Ctrl+A 单次批准、`a` 批准并切至自动模式、`n`/`d`/Ctrl+X 拒绝，Enter 和 Shift+Enter 都不能批准、确认或修改任何文本缓冲。事件缺口或重连会清空瞬态进度，并由 projection adapter 内部重新加载权威 snapshot。事件循环仅在投影或本地状态变化后重绘。Child 运行时，Enter 可以把有界 Follow-up 加入进程内 Mailbox；每个 Session 的单 Runner 只在当前 Child 到达可运行边界后按 FIFO 消费用户输入，不同 Session 使用独立 Runner。
 
 提交后 composer 会立即接收下一条草稿，包括 Shift+Enter 与粘贴，但在上一条 user card 完成持久化对账前不会再次派发。
 
@@ -65,9 +65,9 @@ Composer 模式拥有包括 `q`、`s`、`j`、`k` 和 `?` 在内的全部可打�
 
 ## Agent 运行时
 
-Headless 运行时收集仓库上下文（包括 `AGENTS.md`），调用 OpenAI-compatible chat-completions Provider，通过 engine 执行类型化工具请求，运行配置的验证 argv，并持久化 evidence 与 handoff。需要验证的运行在验证失败、缺失或未执行时不能完成。
+Headless 运行时收集仓库上下文（包括 `AGENTS.md`、`CLAUDE.md` 与工作区顶层概览），调用 OpenAI-compatible chat-completions Provider（支持流式与 `reasoning_content` 回传），通过 engine 执行类型化工具请求（工具输入/路径错误作为结构化 `ToolResult` 回传给模型自纠，不中断会话），按需运行已配置的验证 argv，并持久化 evidence 与 handoff。显式配置了 `verification` 的运行在验证失败、缺失或未执行时会将当前轮记为可重试失败并保持 Session `Ready`，绝不伪造完成。
 
-CLI 支持 `run`、`resume`、`show`、`list`、`context`、`compact`、`serve` 与版本化 JSON 输出；`run`/`list`/`show`/`context`/`compact`/`resume` 都是经内嵌或独立 server 的 session 命令。TUI 是同一 engine 状态上的 Ratatui 投影：通过 snapshot refresh 处理事件滞后，明确呈现权限、输入和 Unknown 状态，并在正常退出、错误、panic 与中断时恢复终端。
+CLI 支持 `tui`、`run`、`resume`、`show`、`list`、`context`、`compact`、`serve`、`--auto` / `--permission-mode` 与版本化 JSON 输出；`run`/`list`/`show`/`context`/`compact`/`resume` 都是经内嵌或独立 server 的 session 命令。TUI 是同一 engine 状态上的 Ratatui 投影：通过 snapshot refresh 与断线自动重连处理事件滞后，明确呈现权限、输入和 Unknown 状态，并在正常退出、错误、panic 与中断时恢复终端。
 
 ## 信任边界
 

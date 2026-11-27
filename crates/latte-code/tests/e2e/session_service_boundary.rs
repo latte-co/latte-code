@@ -2,7 +2,7 @@ use super::support::{PtySession, Scenario};
 use latte_core::{IdSource, SessionId, SessionLifecycle, SessionProviderBinding, SystemIdSource};
 use latte_headless::{
     provider::{FakeProvider, InputRequest, ProviderResponse, ProviderUsage, ToolCall},
-    registry::{ProviderBinding, ResolvedProvider},
+    registry::{ProviderModelBinding, ResolvedProvider},
     runtime::VerificationPlan,
     session::{
         SessionHistoryPolicy, SessionProviderFactory, SessionRuntimeError, SessionRuntimeService,
@@ -15,7 +15,7 @@ const F10: &[u8] = b"\x1b[21~";
 
 fn binding(provider: &str, model: &str) -> SessionProviderBinding {
     SessionProviderBinding {
-        version: 1,
+        binding_version: 1,
         provider_name: provider.into(),
         provider_type: "openai-chat".into(),
         protocol: "openai-chat-completions-v1".into(),
@@ -45,8 +45,8 @@ fn factory(responses: impl IntoIterator<Item = ProviderResponse>) -> SessionProv
     Arc::new(move |selected| {
         Ok(ResolvedProvider {
             provider: provider.clone(),
-            binding: ProviderBinding {
-                version: selected.version,
+            binding: ProviderModelBinding {
+                binding_version: selected.binding_version,
                 provider_name: selected.provider_name.clone(),
                 provider_type: selected.provider_type.clone(),
                 protocol: selected.protocol.clone(),
@@ -104,37 +104,37 @@ async fn public_session_service_state_and_configuration_matrix_is_final_cli_visi
     assert_eq!(ready.lifecycle, SessionLifecycle::Ready);
     assert_eq!(
         service
-            .switch_model(session_id, ready.revision, &ready.binding)
+            .switch_model(session_id, ready.session_revision, &ready.binding)
             .unwrap()
-            .revision,
-        ready.revision
+            .session_revision,
+        ready.session_revision
     );
 
     let mut invalid = ready.binding.clone();
     invalid.provider_name.clear();
     assert!(matches!(
-        service.switch_model(session_id, ready.revision, &invalid),
+        service.switch_model(session_id, ready.session_revision, &invalid),
         Err(SessionRuntimeError::ProviderConfiguration(_))
     ));
     let secondary = binding("secondary", "model-b");
     assert!(matches!(
-        service.switch_model(session_id, ready.revision + 1, &secondary),
+        service.switch_model(session_id, ready.session_revision + 1, &secondary),
         Err(SessionRuntimeError::InvalidState)
     ));
     let switched = service
-        .switch_model(session_id, ready.revision, &secondary)
+        .switch_model(session_id, ready.session_revision, &secondary)
         .unwrap();
     assert_eq!(switched.binding, secondary);
     assert!(matches!(
         service
-            .follow_up(session_id, ready.revision, "stale follow-up".into())
+            .follow_up(session_id, ready.session_revision, "stale follow-up".into())
             .await,
         Err(SessionRuntimeError::InvalidState)
     ));
     let followed = service
         .follow_up(
             session_id,
-            switched.revision,
+            switched.session_revision,
             "accepted follow-up through switched model".into(),
         )
         .await
@@ -146,7 +146,7 @@ async fn public_session_service_state_and_configuration_matrix_is_final_cli_visi
         service
             .provide_input(
                 session_id,
-                followed.revision,
+                followed.session_revision,
                 0,
                 "not-waiting".into(),
                 "value".into(),
@@ -158,7 +158,7 @@ async fn public_session_service_state_and_configuration_matrix_is_final_cli_visi
         service
             .resolve_permission(
                 session_id,
-                followed.revision,
+                followed.session_revision,
                 0,
                 "not-waiting".into(),
                 false,
@@ -172,7 +172,7 @@ async fn public_session_service_state_and_configuration_matrix_is_final_cli_visi
     ));
     service.cancel(session_id);
     assert!(matches!(
-        service.cancel_durable(session_id, followed.revision, 0),
+        service.cancel_durable(session_id, followed.session_revision, 0),
         Err(SessionRuntimeError::InvalidState)
     ));
     let missing = SessionId::from_uuid(SystemIdSource::default().next_uuid_v7());
@@ -231,8 +231,14 @@ async fn public_session_service_state_and_configuration_matrix_is_final_cli_visi
             && entry.text.contains("selected model could not be started")
     }));
 
+    let strict_engine = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.database_path())
+        .require_verification(true)
+        .build()
+        .unwrap();
     let no_verification = SessionRuntimeService::new(
-        engine.clone(),
+        strict_engine.clone(),
         scenario.root(),
         SessionHistoryPolicy::default(),
         factory([
@@ -282,7 +288,7 @@ async fn public_session_service_state_and_configuration_matrix_is_final_cli_visi
     let failed_verification = no_verification
         .resolve_permission(
             waiting.session_id,
-            waiting.revision,
+            waiting.session_revision,
             turn_revision,
             request_id,
             true,
@@ -291,6 +297,7 @@ async fn public_session_service_state_and_configuration_matrix_is_final_cli_visi
         .unwrap();
     assert_eq!(failed_verification.lifecycle, SessionLifecycle::Failed);
     assert!(scenario.root().join("service-write.txt").exists());
+    drop(strict_engine);
 
     let invalid_outcomes = [
         ProviderResponse {
@@ -345,17 +352,33 @@ async fn public_session_service_state_and_configuration_matrix_is_final_cli_visi
         assert_eq!(invalid.lifecycle, SessionLifecycle::Failed);
     }
 
-    std::fs::create_dir(scenario.root().join("unreadable-as-file")).unwrap();
+    let readonly_dir = scenario.root().join("readonly-dir");
+    std::fs::create_dir(&readonly_dir).unwrap();
+    std::fs::set_permissions(
+        &readonly_dir,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o555),
+    )
+    .unwrap();
+    let auto_engine = latte_engine::EngineBuilder::new()
+        .workspace_root(scenario.root())
+        .database_path(scenario.database_path())
+        .permission_mode(latte_core::PermissionMode::FullAuto)
+        .build()
+        .unwrap();
     let uncertain_tool = SessionRuntimeService::new(
-        engine.clone(),
+        auto_engine.clone(),
         scenario.root(),
         SessionHistoryPolicy::default(),
         factory([ProviderResponse {
             message: None,
             tool_calls: vec![ToolCall {
-                id: "missing-read".into(),
-                name: "read_file".into(),
-                input: serde_json::json!({"path":"unreadable-as-file"}),
+                id: "uncertain-write".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({
+                    "path":"readonly-dir/out.txt",
+                    "content":"blocked after start\n",
+                    "create_intent":true
+                }),
             }],
             input_request: None,
             usage: ProviderUsage::default(),
@@ -372,6 +395,12 @@ async fn public_session_service_state_and_configuration_matrix_is_final_cli_visi
         )
         .await
         .unwrap();
+    std::fs::set_permissions(
+        &readonly_dir,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    drop(auto_engine);
     assert_eq!(
         reconciliation.lifecycle,
         SessionLifecycle::ReconciliationRequired
